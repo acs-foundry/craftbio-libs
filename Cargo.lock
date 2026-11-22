@@ -221,22 +221,24 @@ dependencies = [
 
 [[package]]
 name = "craftbio-report"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
+ "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "craftbio-sandbox"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rustix",
+ "serde",
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "craftbio-scene"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "craft-ipc",
  "serde",
@@ -246,7 +248,7 @@ dependencies = [
 
 [[package]]
 name = "craftbio-struct"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rayon",
  "serde",
@@ -255,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "craftbio-viewport"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytemuck",
  "craftbio-scene",

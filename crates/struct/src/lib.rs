@@ -8,6 +8,7 @@ pub mod analysis;
 pub mod io;
 pub mod model;
 pub mod selection;
+pub mod volume;
 
 pub use align::{
     RigidTransform, kabsch_superpose, matchmaker_align, needleman_wunsch_pairs,
@@ -28,6 +29,10 @@ pub use model::{
     nucleotide_color, vdw_radius,
 };
 pub use selection::evaluate_selection;
+pub use volume::{
+    MAX_VOLUME_VOXELS, MapFitReport, VolumeGrid3D, extract_isosurface_nodes, fit_model_in_map,
+    parse_dx_map, parse_mrc_map, simulate_cryoem_map, write_mrc_map,
+};
 
 #[cfg(test)]
 mod tests {
@@ -134,6 +139,22 @@ END
         assert_eq!(loaded, 2);
         let multi = write_multi_model_pdb(&mol_traj);
         assert!(multi.contains("MODEL        2"));
+
+        // Cryo-EM MRC2014 molmap -> write_mrc_map -> parse_mrc_map -> fit_model_in_map -> isosurface
+        let vol = simulate_cryoem_map(&mol, 4.0, 1.5)?;
+        let mrc_bytes = write_mrc_map(&vol);
+        let vol2 = parse_mrc_map("rt_mrc", &mrc_bytes)?;
+        assert_eq!(vol2.dims, vol.dims);
+        let mut mol_fit = mol.clone();
+        let fit = fit_model_in_map(&mut mol_fit, &vol2, 6);
+        assert!(fit.correlation_after > 0.7);
+        let iso = extract_isosurface_nodes(&vol2, 1.5, 400);
+        assert!(!iso.is_empty());
+
+        // OpenDX .dx grid parse test
+        let dx = "object 1 class gridpositions counts 2 2 2\norigin 0 0 0\ndelta 1 0 0\ndelta 0 1 0\ndelta 0 0 1\nobject 3 class array type double rank 0 items 8 data follows\n1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0\n";
+        let gdx = parse_dx_map("dx_test", dx)?;
+        assert_eq!(gdx.dims, [2, 2, 2]);
         Ok(())
     }
 }

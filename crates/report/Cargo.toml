@@ -11,4 +11,5 @@ description = "Shared XSS-safe HTML/SVG reporting primitives and offline Mol* as
 workspace = true
 
 [dependencies]
+serde.workspace = true
 serde_json.workspace = true

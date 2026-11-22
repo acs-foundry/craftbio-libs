@@ -3,6 +3,8 @@
 //! `craftbio-sandbox` — Kernel-confined `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`
 //! with `O_NOFOLLOW` dirfd-descent fallback shared across all CraftBio applications.
 
+pub mod wasm_inspect;
+
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
@@ -11,6 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use rustix::fs::{Mode, OFlags, ResolveFlags, fstat, mkdirat, openat, openat2};
 use rustix::io::Errno;
 use thiserror::Error;
+pub use wasm_inspect::{MAX_WASM_BYTES, WasmPluginReport, inspect_wasm_plugin};
 
 /// Default maximum readable biomolecular structure / trajectory file size (64 MiB).
 pub const DEFAULT_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
@@ -285,6 +288,24 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    fn wasm_inspector_validates_binary_exports_and_rejects_bad_magic()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Minimal valid WASM v1 module with an Export section exporting "analyze" (func 0)
+        let wasm: Vec<u8> = vec![
+            0x00, 0x61, 0x73, 0x6d, // \0asm
+            0x01, 0x00, 0x00, 0x00, // version 1
+            0x07, 0x0b, // export section, len 11
+            0x01, // 1 export
+            0x07, b'a', b'n', b'a', b'l', b'y', b'z', b'e', 0x00, 0x00,
+        ];
+        let rep = inspect_wasm_plugin(&wasm)?;
+        assert_eq!(rep.version, 1);
+        assert_eq!(rep.exports, vec!["analyze".to_string()]);
+        assert!(inspect_wasm_plugin(b"not_wasm_bytes").is_err());
         Ok(())
     }
 }

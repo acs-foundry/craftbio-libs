@@ -3,7 +3,13 @@
 //! `craftbio-report` — Shared XSS-Safe HTML/XML Escaping, Offline Mol* Asset Resolution,
 //! and Portable Reporting Utilities for all CraftBio Applications.
 
+pub mod dossier;
+
 use std::path::PathBuf;
+
+pub use dossier::{
+    ArtCraftBundleSummary, HtmlDossierSummary, export_artcraft_bundle, write_biomol_html_dossier,
+};
 
 /// Resolve the shared CraftBio local data directory (`CRAFT_DATA_DIR` or `/home/acs/Datos/CraftBio`).
 #[must_use]
@@ -75,5 +81,36 @@ mod tests {
         let escaped = escape_markup("<script>alert('x') & \"y\"</script>");
         assert!(!escaped.contains('<'));
         assert!(escaped.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn writes_dossier_html_and_artcraft_bundle() -> Result<(), Box<dyn std::error::Error>> {
+        let base = std::env::temp_dir().join(format!("craftbio_rep_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let html_path = base.join("dossier.html");
+        let sum = write_biomol_html_dossier(
+            "Test <Complex>",
+            "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 90.00           C\nEND\n",
+            "# Report",
+            &[("SVG Chart", "<svg></svg>")],
+            false,
+            &html_path,
+        )?;
+        assert!(sum.bytes > 500);
+        let raw = std::fs::read_to_string(&html_path)?;
+        assert!(raw.contains("&lt;Complex&gt;"));
+
+        let bundle = export_artcraft_bundle(
+            "Test ArtCraft",
+            b"\x89PNG\r\n\x1a\n",
+            &[("RMSD", "0.88 A".to_string())],
+            "# Summary",
+            &base.join("artcraft"),
+        )?;
+        assert!(std::path::Path::new(&bundle.gridcraft_tsv).is_file());
+        assert!(std::path::Path::new(&bundle.wordcraft_md).is_file());
+        assert!(std::path::Path::new(&bundle.deckcraft_slides_md).is_file());
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
     }
 }
