@@ -13,13 +13,14 @@ use craftbio_scene::{
     RepresentationKind, ScaleBarSpec, SphereOverlay,
 };
 use craftbio_struct::{
-    Biomolecule, ResidueClass, SecondaryStructure, VolumeGrid3D, compute_esp_at_points,
+    Biomolecule, ResidueClass, SecondaryStructure, UnitCell, VolumeGrid3D, compute_esp_at_points,
     compute_per_atom_mlp, compute_per_atom_sap, cpk_color, dist3, nucleotide_color, vdw_radius,
 };
 
 use crate::mesh::{
-    TriangleMesh, build_cartoon_mesh, build_putty_mesh, build_ses_surface_mesh,
-    export_meshes_to_glb, export_meshes_to_obj, extract_isosurface_mesh,
+    TriangleMesh, build_cartoon_mesh, build_orthoplanes_mesh, build_putty_mesh,
+    build_ses_surface_mesh, build_snfg_glycans_mesh, export_meshes_to_glb, export_meshes_to_obj,
+    extract_isosurface_mesh,
 };
 
 /// Single GPU ray-cast sphere impostor instance.
@@ -154,6 +155,13 @@ pub struct RenderOptions {
     pub labels_2d: Vec<Label2D>,
     pub color_key: Option<ColorKeyLegend>,
     pub scale_bar: Option<ScaleBarSpec>,
+    /// Render 3D SNFG Glycan blocks/spheres/cones (`NAG`, `MAN`, `FUC`, `GAL`, `SIA`).
+    pub show_snfg_glycans: bool,
+    /// Render crystallographic `CRYST1` Unit Cell wireframe box.
+    pub show_unit_cell: bool,
+    /// Render orthogonal XY/XZ/YZ volumetric density Orthoplanes when `volume_grid` is present.
+    pub show_orthoplanes: bool,
+    pub orthoplane_frac: [f32; 3],
 }
 
 impl Default for RenderOptions {
@@ -183,6 +191,10 @@ impl Default for RenderOptions {
             labels_2d: Vec::new(),
             color_key: None,
             scale_bar: None,
+            show_snfg_glycans: false,
+            show_unit_cell: false,
+            show_orthoplanes: false,
+            orthoplane_frac: [0.5, 0.5, 0.5],
         }
     }
 }
@@ -254,6 +266,37 @@ fn plddt_colormap(b: f64) -> [f32; 3] {
         [0.99, 0.84, 0.22]
     } else {
         [0.98, 0.48, 0.25]
+    }
+}
+
+/// Emit a crisp 12-edge 3D crystallographic `UnitCell` wireframe box (ChimeraX `unitcell`).
+pub fn push_unit_cell_wireframe(scene: &mut RenderSceneData, uc: &UnitCell, rgba: [f32; 4]) {
+    let (corners, edges) = uc.wireframe_edges();
+    for &(u, v) in &edges {
+        let a = [
+            corners[u][0] as f32,
+            corners[u][1] as f32,
+            corners[u][2] as f32,
+        ];
+        let b = [
+            corners[v][0] as f32,
+            corners[v][1] as f32,
+            corners[v][2] as f32,
+        ];
+        scene.capsules.push(CapsuleInstance {
+            a,
+            radius: 0.24,
+            b,
+            dashed: 0.0,
+            color: rgba,
+        });
+    }
+    for &c in &corners {
+        scene.spheres.push(SphereInstance {
+            center: [c[0] as f32, c[1] as f32, c[2] as f32],
+            radius: 0.42,
+            color: rgba,
+        });
     }
 }
 
@@ -477,7 +520,7 @@ pub fn build_render_scene(mol: &Biomolecule, opts: &RenderOptions) -> RenderScen
         }
     }
 
-    // 3. Optional Volumetric Cryo-EM / APBS Isosurface Mesh (true Marching Tetrahedra)
+    // 3. Optional Volumetric Cryo-EM / APBS Isosurface Mesh + Orthoplanes (XY/XZ/YZ)
     if let Some(ref vol) = opts.volume_grid {
         let iso = (vol.mean + opts.volume_sigma * vol.std_dev) as f32;
         let vol_mesh = extract_isosurface_mesh(
@@ -491,6 +534,36 @@ pub fn build_render_scene(mol: &Biomolecule, opts: &RenderOptions) -> RenderScen
         if !vol_mesh.indices.is_empty() {
             scene.transparent_meshes.push(vol_mesh);
         }
+        if opts.show_orthoplanes {
+            let ortho = build_orthoplanes_mesh(vol, opts.orthoplane_frac, 0.58);
+            if !ortho.indices.is_empty() {
+                scene.transparent_meshes.push(ortho);
+            }
+        }
+    }
+
+    // 3B. Optional 3D SNFG Glycan Blocks/Spheres/Cones + Glycosidic Rods
+    if opts.show_snfg_glycans {
+        let (glyc_mesh, links) = build_snfg_glycans_mesh(mol);
+        if !glyc_mesh.indices.is_empty() {
+            scene.opaque_meshes.push(glyc_mesh);
+        }
+        for (a, b) in links {
+            scene.capsules.push(CapsuleInstance {
+                a,
+                radius: 0.24,
+                b,
+                dashed: 0.0,
+                color: [0.32, 0.36, 0.44, 1.0],
+            });
+        }
+    }
+
+    // 3C. Optional Crystallographic Unit Cell Wireframe (`CRYST1`)
+    if opts.show_unit_cell
+        && let Some(ref uc) = mol.unit_cell
+    {
+        push_unit_cell_wireframe(&mut scene, uc, [0.36, 0.88, 0.98, 0.92]);
     }
 
     // 4. RNA/DNA Base-Pair Dashed Rungs

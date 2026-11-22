@@ -144,6 +144,12 @@ pub struct Biomolecule {
     pub frames: Vec<TrajectoryFrame>,
     pub active_frame: usize,
     pub is_alphafold_plddt: bool,
+    #[serde(default)]
+    pub unit_cell: Option<crate::symmetry::UnitCell>,
+    #[serde(default)]
+    pub biomt_ops: Vec<crate::symmetry::SymmetryOp>,
+    #[serde(default)]
+    pub altlocs: Vec<crate::symmetry::AltLocRecord>,
 }
 
 impl Biomolecule {

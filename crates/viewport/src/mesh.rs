@@ -13,7 +13,10 @@ use std::f32::consts::TAU;
 use std::fmt::Write as _;
 
 use bytemuck::{Pod, Zeroable};
-use craftbio_struct::{Biomolecule, ResidueClass, SecondaryStructure, VolumeGrid3D, vdw_radius};
+use craftbio_struct::{
+    Biomolecule, ResidueClass, SecondaryStructure, SnfgShape, VolumeGrid3D, detect_snfg_glycans,
+    vdw_radius,
+};
 use rayon::prelude::*;
 use serde_json::json;
 
@@ -1356,4 +1359,304 @@ pub fn export_meshes_to_glb(meshes: &[&TriangleMesh], title: &str) -> Vec<u8> {
     glb.extend_from_slice(&0x004E_4942u32.to_le_bytes());
     glb.extend_from_slice(&bin);
     glb
+}
+
+fn push_uv_sphere(mesh: &mut TriangleMesh, center: [f32; 3], radius: f32, color: [f32; 4]) {
+    const LAT: usize = 8;
+    const LON: usize = 12;
+    let base = mesh.vertices.len() as u32;
+    for i in 0..=LAT {
+        let theta = (i as f32) * std::f32::consts::PI / (LAT as f32);
+        let st = theta.sin();
+        let ct = theta.cos();
+        for j in 0..=LON {
+            let phi = (j as f32) * TAU / (LON as f32);
+            let n = [st * phi.cos(), ct, st * phi.sin()];
+            mesh.vertices.push(MeshVertex {
+                position: add3(center, scale3(n, radius)),
+                normal: n,
+                color,
+            });
+        }
+    }
+    let row = (LON + 1) as u32;
+    for i in 0..(LAT as u32) {
+        for j in 0..(LON as u32) {
+            let a = base + i * row + j;
+            let b = a + row;
+            mesh.indices
+                .extend_from_slice(&[a, b, a + 1, a + 1, b, b + 1]);
+        }
+    }
+}
+
+fn push_octahedron(mesh: &mut TriangleMesh, center: [f32; 3], radius: f32, color: [f32; 4]) {
+    let dirs: [[f32; 3]; 6] = [
+        [0.0, 1.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0],
+        [0.0, -1.0, 0.0],
+    ];
+    let pts: Vec<[f32; 3]> = dirs
+        .iter()
+        .map(|&d| add3(center, scale3(d, radius)))
+        .collect();
+    let faces = [
+        (0, 2, 1),
+        (0, 3, 2),
+        (0, 4, 3),
+        (0, 1, 4),
+        (5, 1, 2),
+        (5, 2, 3),
+        (5, 3, 4),
+        (5, 4, 1),
+    ];
+    for &(i0, i1, i2) in &faces {
+        let n = normalize3(cross3(sub3(pts[i1], pts[i0]), sub3(pts[i2], pts[i0])));
+        let base = mesh.vertices.len() as u32;
+        for &idx in &[i0, i1, i2] {
+            mesh.vertices.push(MeshVertex {
+                position: pts[idx],
+                normal: n,
+                color,
+            });
+        }
+        mesh.indices.extend_from_slice(&[base, base + 1, base + 2]);
+    }
+}
+
+fn push_cone(mesh: &mut TriangleMesh, center: [f32; 3], radius: f32, color: [f32; 4]) {
+    const SEGS: usize = 10;
+    let apex = add3(center, [0.0, radius * 1.15, 0.0]);
+    let base_y = center[1] - radius * 0.85;
+    let base_center = [center[0], base_y, center[2]];
+    let mut ring = Vec::with_capacity(SEGS);
+    for s in 0..SEGS {
+        let ang = (s as f32) * TAU / (SEGS as f32);
+        ring.push([
+            center[0] + radius * ang.cos(),
+            base_y,
+            center[2] + radius * ang.sin(),
+        ]);
+    }
+    for s in 0..SEGS {
+        let p0 = ring[s];
+        let p1 = ring[(s + 1) % SEGS];
+        let n = normalize3(cross3(sub3(p1, apex), sub3(p0, apex)));
+        let b = mesh.vertices.len() as u32;
+        for &p in &[apex, p1, p0] {
+            mesh.vertices.push(MeshVertex {
+                position: p,
+                normal: n,
+                color,
+            });
+        }
+        mesh.indices.extend_from_slice(&[b, b + 1, b + 2]);
+        // Base cap
+        let bc = mesh.vertices.len() as u32;
+        for &p in &[base_center, p0, p1] {
+            mesh.vertices.push(MeshVertex {
+                position: p,
+                normal: [0.0, -1.0, 0.0],
+                color,
+            });
+        }
+        mesh.indices.extend_from_slice(&[bc, bc + 1, bc + 2]);
+    }
+}
+
+/// 3D segment endpoint pair `(start, end)` in Ångströms.
+pub type Segment3D = ([f32; 3], [f32; 3]);
+
+/// Build official **SNFG 3D Glycan** geometric glyphs (Blue Cubes = GlcNAc, Green Spheres = Man,
+/// Yellow Spheres = Gal, Red Cones = Fuc, Purple Diamonds = Neu5Ac) and covalent glycosidic rods.
+#[must_use]
+pub fn build_snfg_glycans_mesh(mol: &Biomolecule) -> (TriangleMesh, Vec<Segment3D>) {
+    let report = detect_snfg_glycans(mol);
+    let mut mesh = TriangleMesh::default();
+    for nd in &report.nodes {
+        let c = [
+            nd.centroid[0] as f32,
+            nd.centroid[1] as f32,
+            nd.centroid[2] as f32,
+        ];
+        let r = nd.radius_a as f32;
+        let col = [nd.rgb[0], nd.rgb[1], nd.rgb[2], 1.0];
+        match nd.shape {
+            SnfgShape::Cube => push_oriented_slab(
+                &mut mesh,
+                c,
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [r * 0.92, r * 0.92, r * 0.92],
+                col,
+            ),
+            SnfgShape::Sphere => push_uv_sphere(&mut mesh, c, r * 0.96, col),
+            SnfgShape::Cone => push_cone(&mut mesh, c, r * 1.05, col),
+            SnfgShape::Diamond | SnfgShape::Star => push_octahedron(&mut mesh, c, r * 1.15, col),
+        }
+    }
+    let links: Vec<([f32; 3], [f32; 3])> = report
+        .links
+        .iter()
+        .map(|l| {
+            (
+                [l.from[0] as f32, l.from[1] as f32, l.from[2] as f32],
+                [l.to[0] as f32, l.to[1] as f32, l.to[2] as f32],
+            )
+        })
+        .collect();
+    (mesh, links)
+}
+
+/// Build 3 orthogonal translucent **Orthoplanes (XY / XZ / YZ)** slicing through a `VolumeGrid3D`
+/// at normalized slice coordinates `frac = [fx, fy, fz]` in `[0.05..=0.95]` (ChimeraX Orthoplanes).
+#[must_use]
+pub fn build_orthoplanes_mesh(grid: &VolumeGrid3D, frac: [f32; 3], alpha: f32) -> TriangleMesh {
+    let [nx, ny, nz] = grid.dims;
+    if nx < 3 || ny < 3 || nz < 3 {
+        return TriangleMesh::default();
+    }
+    let mut mesh = TriangleMesh {
+        vertices: Vec::new(),
+        indices: Vec::new(),
+        is_transparent: true,
+        wireframe: false,
+    };
+    let a = alpha.clamp(0.18, 0.92);
+    let step_x = (nx / 28).max(1);
+    let step_y = (ny / 28).max(1);
+    let step_z = (nz / 28).max(1);
+
+    let density_color = |val: f32| -> [f32; 4] {
+        let sig = ((f64::from(val) - grid.mean) / grid.std_dev.max(1e-6)) as f32;
+        let t = ((sig + 0.5) / 4.5).clamp(0.0, 1.0);
+        if t < 0.5 {
+            let u = t * 2.0;
+            [0.08 + 0.14 * u, 0.16 + 0.62 * u, 0.34 + 0.60 * u, a]
+        } else {
+            let u = (t - 0.5) * 2.0;
+            [0.22 + 0.76 * u, 0.78 + 0.14 * u, 0.94 * (1.0 - 0.72 * u), a]
+        }
+    };
+
+    let push_quad = |m: &mut TriangleMesh,
+                     p00: [f32; 3],
+                     p10: [f32; 3],
+                     p11: [f32; 3],
+                     p01: [f32; 3],
+                     c00: [f32; 4],
+                     c10: [f32; 4],
+                     c11: [f32; 4],
+                     c01: [f32; 4],
+                     nrm: [f32; 3]| {
+        let base = m.vertices.len() as u32;
+        m.vertices.push(MeshVertex {
+            position: p00,
+            normal: nrm,
+            color: c00,
+        });
+        m.vertices.push(MeshVertex {
+            position: p10,
+            normal: nrm,
+            color: c10,
+        });
+        m.vertices.push(MeshVertex {
+            position: p11,
+            normal: nrm,
+            color: c11,
+        });
+        m.vertices.push(MeshVertex {
+            position: p01,
+            normal: nrm,
+            color: c01,
+        });
+        m.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    };
+
+    let pt = |x: usize, y: usize, z: usize| -> [f32; 3] {
+        let p = grid.voxel_world(x, y, z);
+        [p[0] as f32, p[1] as f32, p[2] as f32]
+    };
+
+    // 1. XY slice at fixed z
+    let iz = ((frac[2].clamp(0.05, 0.95)) * ((nz - 1) as f32)).round() as usize;
+    let mut y = 0usize;
+    while y + step_y < ny {
+        let y1 = (y + step_y).min(ny - 1);
+        let mut x = 0usize;
+        while x + step_x < nx {
+            let x1 = (x + step_x).min(nx - 1);
+            push_quad(
+                &mut mesh,
+                pt(x, y, iz),
+                pt(x1, y, iz),
+                pt(x1, y1, iz),
+                pt(x, y1, iz),
+                density_color(grid.get(x, y, iz)),
+                density_color(grid.get(x1, y, iz)),
+                density_color(grid.get(x1, y1, iz)),
+                density_color(grid.get(x, y1, iz)),
+                [0.0, 0.0, 1.0],
+            );
+            x += step_x;
+        }
+        y += step_y;
+    }
+
+    // 2. XZ slice at fixed y
+    let iy = ((frac[1].clamp(0.05, 0.95)) * ((ny - 1) as f32)).round() as usize;
+    let mut z = 0usize;
+    while z + step_z < nz {
+        let z1 = (z + step_z).min(nz - 1);
+        let mut x = 0usize;
+        while x + step_x < nx {
+            let x1 = (x + step_x).min(nx - 1);
+            push_quad(
+                &mut mesh,
+                pt(x, iy, z),
+                pt(x1, iy, z),
+                pt(x1, iy, z1),
+                pt(x, iy, z1),
+                density_color(grid.get(x, iy, z)),
+                density_color(grid.get(x1, iy, z)),
+                density_color(grid.get(x1, iy, z1)),
+                density_color(grid.get(x, iy, z1)),
+                [0.0, 1.0, 0.0],
+            );
+            x += step_x;
+        }
+        z += step_z;
+    }
+
+    // 3. YZ slice at fixed x
+    let ix = ((frac[0].clamp(0.05, 0.95)) * ((nx - 1) as f32)).round() as usize;
+    let mut z = 0usize;
+    while z + step_z < nz {
+        let z1 = (z + step_z).min(nz - 1);
+        let mut y = 0usize;
+        while y + step_y < ny {
+            let y1 = (y + step_y).min(ny - 1);
+            push_quad(
+                &mut mesh,
+                pt(ix, y, z),
+                pt(ix, y1, z),
+                pt(ix, y1, z1),
+                pt(ix, y, z1),
+                density_color(grid.get(ix, y, z)),
+                density_color(grid.get(ix, y1, z)),
+                density_color(grid.get(ix, y1, z1)),
+                density_color(grid.get(ix, y, z1)),
+                [1.0, 0.0, 0.0],
+            );
+            y += step_y;
+        }
+        z += step_z;
+    }
+
+    mesh
 }

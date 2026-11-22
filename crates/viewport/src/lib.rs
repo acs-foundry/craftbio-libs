@@ -15,13 +15,14 @@ pub mod overlay_2d;
 pub use camera::{Camera3D, cross3, dot3, normalize3};
 pub use geometry::{
     CapsuleInstance, RenderOptions, RenderSceneData, SphereInstance, build_render_scene,
-    push_grid_box_wireframe,
+    push_grid_box_wireframe, push_unit_cell_wireframe,
 };
 pub use gpu_renderer::{SharedViewportScene, show_biomol_viewport};
 pub use headless_png::{RenderError, render_scene_png_bytes, render_scene_rgba, write_scene_png};
 pub use mesh::{
-    MeshVertex, TriangleMesh, build_cartoon_mesh, build_putty_mesh, build_ses_surface_mesh,
-    export_meshes_to_glb, export_meshes_to_obj, extract_isosurface_mesh,
+    MeshVertex, TriangleMesh, build_cartoon_mesh, build_orthoplanes_mesh, build_putty_mesh,
+    build_ses_surface_mesh, build_snfg_glycans_mesh, export_meshes_to_glb, export_meshes_to_obj,
+    extract_isosurface_mesh,
 };
 pub use movie::{
     encode_gif89a, interpolate_camera, render_fly_frames, render_rock_frames,
@@ -184,6 +185,49 @@ END
         assert_eq!(&gif_raw[..6], b"GIF89a");
         assert_eq!(gif_raw.last().copied(), Some(0x3B));
         let _ = std::fs::remove_file(&gif_path);
+        Ok(())
+    }
+
+    #[test]
+    fn wave6_snfg_glycans_unitcell_and_orthoplanes_render() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let pdb = "\
+CRYST1   18.000   18.000   18.000  90.00  90.00  90.00 P 21 21 21    4
+ATOM      1  CA  ASN A 297       4.000   4.000   4.000  1.00 22.00           C
+ATOM      2  ND2 ASN A 297       5.500   4.000   4.000  1.00 22.00           N
+HETATM    3  C1  NAG A 501       6.950   4.000   4.000  1.00 35.00           C
+HETATM    4  C2  NAG A 501       7.700   5.100   4.000  1.00 35.00           C
+HETATM    5  C3  NAG A 501       9.100   5.000   4.000  1.00 35.00           C
+HETATM    6  C1  MAN A 502      10.900   5.000   4.000  1.00 38.00           C
+HETATM    7  C1  FUC A 503       8.000   2.400   5.200  1.00 40.00           C
+END
+";
+        let mol = parse_pdb("w6_vp", pdb)?;
+        let vol = simulate_cryoem_map(&mol, 4.0, 1.4)?;
+        let opts = RenderOptions {
+            show_snfg_glycans: true,
+            show_unit_cell: true,
+            volume_grid: Some(vol),
+            show_orthoplanes: true,
+            ..RenderOptions::default()
+        };
+        let scene = build_render_scene(&mol, &opts);
+        assert!(
+            !scene.opaque_meshes.is_empty(),
+            "expected 3D SNFG glycan meshes"
+        );
+        assert!(
+            scene.transparent_meshes.len() >= 2,
+            "expected isosurface + orthoplanes meshes"
+        );
+        assert!(
+            scene.capsules.len() >= 12,
+            "expected 12 CRYST1 unit-cell edges + glycan rods"
+        );
+        let mut cam = Camera3D::default();
+        cam.focus_on_biomolecule(&mol);
+        let png = render_scene_png_bytes(&scene, &cam, 240, 180, false)?;
+        assert!(png.len() > 1000 && &png[..8] == b"\x89PNG\r\n\x1a\n");
         Ok(())
     }
 }

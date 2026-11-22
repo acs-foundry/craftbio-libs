@@ -145,6 +145,267 @@ impl VolumeGrid3D {
             self.origin[2] + (z as f64) * self.voxel_size[2],
         ]
     }
+
+    /// 3D separable Gaussian smoothing filter (ChimeraX `vop gaussian`).
+    pub fn volume_gaussian(&self, sigma_a: f64) -> Result<Self, BioStructError> {
+        let [nx, ny, nz] = self.dims;
+        let sig = sigma_a.clamp(0.4, 8.0);
+        let kernel_1d = |vox: f64| -> Vec<f32> {
+            let s_vox = (sig / vox.max(0.1)).clamp(0.4, 5.0);
+            let rad = (s_vox * 2.5).ceil() as usize;
+            let mut k = vec![0.0_f32; 2 * rad + 1];
+            let mut sum = 0.0_f32;
+            for (i, slot) in k.iter_mut().enumerate() {
+                let d = (i as f64) - (rad as f64);
+                let w = (-0.5 * (d / s_vox).powi(2)).exp() as f32;
+                *slot = w;
+                sum += w;
+            }
+            for w in &mut k {
+                *w /= sum.max(1e-6);
+            }
+            k
+        };
+        let kx = kernel_1d(self.voxel_size[0]);
+        let ky = kernel_1d(self.voxel_size[1]);
+        let kz = kernel_1d(self.voxel_size[2]);
+        let rx = kx.len() / 2;
+        let ry = ky.len() / 2;
+        let rz = kz.len() / 2;
+
+        // Pass X
+        let mut tmp_x = vec![0.0_f32; self.values.len()];
+        for z in 0..nz {
+            for y in 0..ny {
+                let base = z * nx * ny + y * nx;
+                for x in 0..nx {
+                    let mut acc = 0.0_f32;
+                    for (ki, &w) in kx.iter().enumerate() {
+                        let sx = (x as isize + ki as isize - rx as isize).clamp(0, nx as isize - 1)
+                            as usize;
+                        acc += self.values[base + sx] * w;
+                    }
+                    tmp_x[base + x] = acc;
+                }
+            }
+        }
+        // Pass Y
+        let mut tmp_y = vec![0.0_f32; self.values.len()];
+        for z in 0..nz {
+            let zoff = z * nx * ny;
+            for y in 0..ny {
+                for x in 0..nx {
+                    let mut acc = 0.0_f32;
+                    for (ki, &w) in ky.iter().enumerate() {
+                        let sy = (y as isize + ki as isize - ry as isize).clamp(0, ny as isize - 1)
+                            as usize;
+                        acc += tmp_x[zoff + sy * nx + x] * w;
+                    }
+                    tmp_y[zoff + y * nx + x] = acc;
+                }
+            }
+        }
+        // Pass Z
+        let mut out = vec![0.0_f32; self.values.len()];
+        for z in 0..nz {
+            for y in 0..ny {
+                let yoff = y * nx;
+                for x in 0..nx {
+                    let mut acc = 0.0_f32;
+                    for (ki, &w) in kz.iter().enumerate() {
+                        let sz = (z as isize + ki as isize - rz as isize).clamp(0, nz as isize - 1)
+                            as usize;
+                        acc += tmp_y[sz * nx * ny + yoff + x] * w;
+                    }
+                    out[z * nx * ny + yoff + x] = acc;
+                }
+            }
+        }
+        Self::from_raw(
+            format!("{}_gauss({sig:.1}A)", self.label),
+            self.dims,
+            self.origin,
+            self.voxel_size,
+            out,
+        )
+    }
+
+    /// Unsharp-mask / B-factor Cryo-EM density sharpening (ChimeraX `vop sharpen`).
+    pub fn volume_sharpen(&self, amount: f64) -> Result<Self, BioStructError> {
+        let amt = amount.clamp(0.2, 4.0) as f32;
+        let blurred = self.volume_gaussian(2.0)?;
+        let values: Vec<f32> = self
+            .values
+            .iter()
+            .zip(blurred.values.iter())
+            .map(|(&orig, &blur)| orig + amt * (orig - blur))
+            .collect();
+        Self::from_raw(
+            format!("{}_sharpen({amt:.1})", self.label),
+            self.dims,
+            self.origin,
+            self.voxel_size,
+            values,
+        )
+    }
+
+    /// Difference density map `self - other` resampled onto `self` (ChimeraX `vop subtract` / `Fo-Fc`).
+    pub fn volume_subtract(&self, other: &Self) -> Result<Self, BioStructError> {
+        let [nx, ny, nz] = self.dims;
+        let mut values = Vec::with_capacity(self.values.len());
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    let p = self.voxel_world(x, y, z);
+                    let diff = self.get(x, y, z) - (other.sample_trilinear(p) as f32);
+                    values.push(diff);
+                }
+            }
+        }
+        Self::from_raw(
+            format!("{}_minus_{}", self.label, other.label),
+            self.dims,
+            self.origin,
+            self.voxel_size,
+            values,
+        )
+    }
+
+    /// Carve / zone density strictly within `radius_a` of `centers` (ChimeraX `volume zone` / PyMOL `carve`).
+    pub fn volume_zone(&self, centers: &[[f64; 3]], radius_a: f64) -> Result<Self, BioStructError> {
+        if centers.is_empty() {
+            return Ok(self.clone());
+        }
+        let r = radius_a.clamp(1.5, 40.0);
+        let r2 = r * r;
+        let [nx, ny, nz] = self.dims;
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
+        for c in centers {
+            for k in 0..3 {
+                lo[k] = lo[k].min(c[k] - r);
+                hi[k] = hi[k].max(c[k] + r);
+            }
+        }
+        let slices: Vec<Vec<f32>> = (0..nz)
+            .into_par_iter()
+            .map(|z| {
+                let wz = self.origin[2] + (z as f64) * self.voxel_size[2];
+                let mut sl = vec![0.0_f32; nx * ny];
+                if wz < lo[2] || wz > hi[2] {
+                    return sl;
+                }
+                for y in 0..ny {
+                    let wy = self.origin[1] + (y as f64) * self.voxel_size[1];
+                    if wy < lo[1] || wy > hi[1] {
+                        continue;
+                    }
+                    for x in 0..nx {
+                        let wx = self.origin[0] + (x as f64) * self.voxel_size[0];
+                        if wx < lo[0] || wx > hi[0] {
+                            continue;
+                        }
+                        let inside = centers.iter().any(|c| {
+                            let dx = wx - c[0];
+                            let dy = wy - c[1];
+                            let dz = wz - c[2];
+                            dx * dx + dy * dy + dz * dz <= r2
+                        });
+                        if inside {
+                            sl[y * nx + x] = self.get(x, y, z);
+                        }
+                    }
+                }
+                sl
+            })
+            .collect();
+        let mut values = Vec::with_capacity(self.values.len());
+        for mut s in slices {
+            values.append(&mut s);
+        }
+        Self::from_raw(
+            format!("{}_zone({r:.1}A)", self.label),
+            self.dims,
+            self.origin,
+            self.voxel_size,
+            values,
+        )
+    }
+
+    /// 6-connected 3D flood-fill noise-island suppressor (ChimeraX `hide dust`).
+    /// Zeroes all connected islands above `mean + sigma_level * std_dev` smaller than `min_voxels`.
+    pub fn volume_hide_dust(
+        &self,
+        sigma_level: f64,
+        min_voxels: usize,
+    ) -> Result<(Self, usize), BioStructError> {
+        let [nx, ny, nz] = self.dims;
+        let total = self.values.len();
+        let thr = (self.mean + sigma_level * self.std_dev) as f32;
+        let min_v = min_voxels.max(2);
+        let mut visited = vec![false; total];
+        let mut values = self.values.clone();
+        let mut removed_islands = 0usize;
+        let mut queue = std::collections::VecDeque::new();
+
+        for start in 0..total {
+            if visited[start] || values[start] < thr {
+                continue;
+            }
+            visited[start] = true;
+            queue.clear();
+            queue.push_back(start);
+            let mut comp = vec![start];
+            while let Some(u) = queue.pop_front() {
+                let z = u / (nx * ny);
+                let rem = u % (nx * ny);
+                let y = rem / nx;
+                let x = rem % nx;
+                let nbrs: [(isize, isize, isize); 6] = [
+                    (-1, 0, 0),
+                    (1, 0, 0),
+                    (0, -1, 0),
+                    (0, 1, 0),
+                    (0, 0, -1),
+                    (0, 0, 1),
+                ];
+                for &(dx, dy, dz) in &nbrs {
+                    let nx_i = x as isize + dx;
+                    let ny_i = y as isize + dy;
+                    let nz_i = z as isize + dz;
+                    if nx_i >= 0
+                        && (nx_i as usize) < nx
+                        && ny_i >= 0
+                        && (ny_i as usize) < ny
+                        && nz_i >= 0
+                        && (nz_i as usize) < nz
+                    {
+                        let v_idx =
+                            (nz_i as usize) * nx * ny + (ny_i as usize) * nx + (nx_i as usize);
+                        if !visited[v_idx] && values[v_idx] >= thr {
+                            visited[v_idx] = true;
+                            queue.push_back(v_idx);
+                            comp.push(v_idx);
+                        }
+                    }
+                }
+            }
+            if comp.len() < min_v {
+                removed_islands += 1;
+                for idx in comp {
+                    values[idx] = self.mean as f32;
+                }
+            }
+        }
+        let cleaned = Self::from_raw(
+            format!("{}_nodust", self.label),
+            self.dims,
+            self.origin,
+            self.voxel_size,
+            values,
+        )?;
+        Ok((cleaned, removed_islands))
+    }
 }
 
 /// Parse a standard binary MRC2014 / CCP4 `.mrc`/`.map` Cryo-EM density map (mode 2 `f32`) in safe Rust.

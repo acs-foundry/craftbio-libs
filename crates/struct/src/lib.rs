@@ -9,6 +9,7 @@ pub mod io;
 pub mod measure;
 pub mod model;
 pub mod selection;
+pub mod symmetry;
 pub mod volume;
 
 pub use align::{
@@ -37,6 +38,11 @@ pub use model::{
     nucleotide_color, vdw_radius,
 };
 pub use selection::evaluate_selection;
+pub use symmetry::{
+    AltLocRecord, SnfgGlycanLink, SnfgGlycanNode, SnfgGlycanReport, SnfgShape, SymmetryOp,
+    UnitCell, detect_snfg_glycans, generate_biological_assembly, generate_crystal_mates,
+    space_group_fractional_ops,
+};
 pub use volume::{
     MAX_VOLUME_VOXELS, MapFitReport, VolumeGrid3D, extract_isosurface_nodes, fit_model_in_map,
     parse_dx_map, parse_mrc_map, simulate_cryoem_map, write_mrc_map,
@@ -356,6 +362,62 @@ END
         assert_eq!(morphed.frames.len(), 12);
         assert!(dist3(morphed.frames[0].coords[15], mol_a.atoms[15].coords) < 1e-6);
         assert!(dist3(morphed.frames[11].coords[15], morphed.frames[0].coords[15]) > 2.0);
+        Ok(())
+    }
+
+    #[test]
+    fn wave6_symmetry_cryst1_biomt_snfg_and_vop_volume_ops() -> Result<(), BioStructError> {
+        let pdb = "\
+CRYST1   20.000   20.000   20.000  90.00  90.00  90.00 P 21 21 21    4
+REMARK 350   BIOMT1   1  1.000000  0.000000  0.000000        0.00000
+REMARK 350   BIOMT2   1  0.000000  1.000000  0.000000        0.00000
+REMARK 350   BIOMT3   1  0.000000  0.000000  1.000000        0.00000
+REMARK 350   BIOMT1   2 -1.000000  0.000000  0.000000       12.00000
+REMARK 350   BIOMT2   2  0.000000  1.000000  0.000000        0.00000
+REMARK 350   BIOMT3   2  0.000000  0.000000 -1.000000        0.00000
+ATOM      1  CA AASN A 297       1.000   2.000   3.000  0.60 22.00           C
+ATOM      2  CA BASN A 297       1.100   2.100   3.050  0.40 22.00           C
+ATOM      3  ND2 ASN A 297       2.500   2.000   3.000  1.00 22.00           N
+HETATM    4  C1  NAG A 501       3.950   2.000   3.000  1.00 35.00           C
+HETATM    5  C2  NAG A 501       4.700   3.100   3.000  1.00 35.00           C
+HETATM    6  C3  NAG A 501       6.100   3.000   3.000  1.00 35.00           C
+HETATM    7  O5  NAG A 501       4.600   1.000   3.000  1.00 35.00           O
+END
+";
+        let mol = parse_pdb("w6_glyco", pdb)?;
+        assert!(mol.unit_cell.is_some());
+        assert_eq!(mol.biomt_ops.len(), 2);
+        assert_eq!(mol.altlocs.len(), 1);
+
+        let bio = generate_biological_assembly(&mol)?;
+        assert_eq!(bio.atoms.len(), mol.atoms.len() * 2);
+
+        let (mates, _) = generate_crystal_mates(&mol, 15.0)?;
+        assert!(
+            !mates.is_empty(),
+            "expected crystallographic symmetry mates"
+        );
+
+        let glyc = detect_snfg_glycans(&mol);
+        assert_eq!(glyc.nodes.len(), 1);
+        assert_eq!(glyc.nodes[0].canonical_name, "GlcNAc");
+        assert_eq!(glyc.nodes[0].shape, SnfgShape::Cube);
+        assert_eq!(
+            glyc.links.len(),
+            1,
+            "expected ASN297-NAG N-glycosylation link"
+        );
+
+        // Volumetric vop gaussian / sharpen / subtract / zone / hide_dust
+        let vol = simulate_cryoem_map(&mol, 4.0, 1.2)?;
+        let g = vol.volume_gaussian(1.8)?;
+        let s = vol.volume_sharpen(1.2)?;
+        let sub = s.volume_subtract(&g)?;
+        assert_eq!(sub.dims, vol.dims);
+        let carved = vol.volume_zone(&[[3.95, 2.0, 3.0]], 4.0)?;
+        assert!(carved.max_val > 0.0);
+        let (nodust, _) = vol.volume_hide_dust(1.5, 4)?;
+        assert_eq!(nodust.dims, vol.dims);
         Ok(())
     }
 }

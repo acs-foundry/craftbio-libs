@@ -294,6 +294,9 @@ pub fn finalize_biomolecule(
         frames,
         active_frame: 0,
         is_alphafold_plddt,
+        unit_cell: None,
+        biomt_ops: Vec::new(),
+        altlocs: Vec::new(),
     };
     assign_secondary_structure(&mut mol);
     Ok(mol)
@@ -379,12 +382,83 @@ pub fn parse_pdb(id: &str, pdb_text: &str) -> Result<Biomolecule, BioStructError
     let mut is_af = false;
     let mut model_idx = 0usize;
     let mut first_model_done = false;
+    type AltLocKey = (char, i32, String, String);
     let mut best_atoms: HashMap<(char, i32, char, String), Atom> = HashMap::new();
+    let mut altloc_map: BTreeMap<AltLocKey, Vec<(char, f64)>> = BTreeMap::new();
     let mut order_keys: Vec<(char, i32, char, String)> = Vec::new();
     let mut frames: Vec<TrajectoryFrame> = Vec::new();
     let mut cur_frame_coords: Vec<[f64; 3]> = Vec::new();
+    let mut unit_cell: Option<crate::symmetry::UnitCell> = None;
+    let mut biomt_rows: BTreeMap<usize, [[f64; 4]; 3]> = BTreeMap::new();
 
     for line in pdb_text.lines() {
+        if line.starts_with("CRYST1") && line.len() >= 54 {
+            let a: f64 = line.get(6..15).unwrap_or("0").trim().parse().unwrap_or(0.0);
+            let b: f64 = line
+                .get(15..24)
+                .unwrap_or("0")
+                .trim()
+                .parse()
+                .unwrap_or(0.0);
+            let c: f64 = line
+                .get(24..33)
+                .unwrap_or("0")
+                .trim()
+                .parse()
+                .unwrap_or(0.0);
+            let al: f64 = line
+                .get(33..40)
+                .unwrap_or("90")
+                .trim()
+                .parse()
+                .unwrap_or(90.0);
+            let be: f64 = line
+                .get(40..47)
+                .unwrap_or("90")
+                .trim()
+                .parse()
+                .unwrap_or(90.0);
+            let ga: f64 = line
+                .get(47..54)
+                .unwrap_or("90")
+                .trim()
+                .parse()
+                .unwrap_or(90.0);
+            let sg = line.get(55..66).unwrap_or("P 1").trim().to_string();
+            if a > 1.0 && b > 1.0 && c > 1.0 {
+                unit_cell = Some(crate::symmetry::UnitCell {
+                    a,
+                    b,
+                    c,
+                    alpha_deg: al,
+                    beta_deg: be,
+                    gamma_deg: ga,
+                    space_group: if sg.is_empty() { "P 1".to_string() } else { sg },
+                });
+            }
+            continue;
+        }
+        if line.starts_with("REMARK 350   BIOMT") && line.len() >= 54 {
+            let row_ch = line.as_bytes().get(18).copied().unwrap_or(b'0');
+            if (b'1'..=b'3').contains(&row_ch) {
+                let row_idx = (row_ch - b'1') as usize;
+                let rest = line.get(19..).unwrap_or("");
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                if toks.len() >= 5
+                    && let Ok(op_id) = toks[0].parse::<usize>()
+                    && let (Ok(r0), Ok(r1), Ok(r2), Ok(tr)) = (
+                        toks[1].parse::<f64>(),
+                        toks[2].parse::<f64>(),
+                        toks[3].parse::<f64>(),
+                        toks[4].parse::<f64>(),
+                    )
+                {
+                    let entry = biomt_rows.entry(op_id).or_insert([[0.0; 4]; 3]);
+                    entry[row_idx] = [r0, r1, r2, tr];
+                }
+            }
+            continue;
+        }
         if line.starts_with("MODEL ") {
             if first_model_done {
                 cur_frame_coords.clear();
@@ -495,6 +569,14 @@ pub fn parse_pdb(id: &str, pdb_text: &str) -> Result<Biomolecule, BioStructError
         let charge = approx_atom_charge(res_class, res_code, &atom_name);
 
         let key = (chain, res_seq, icode, atom_name.clone());
+        if alt != ' ' {
+            let e = altloc_map
+                .entry((chain, res_seq, res_name.clone(), atom_name.clone()))
+                .or_default();
+            if !e.iter().any(|&(c, _)| c == alt) {
+                e.push((alt, occ));
+            }
+        }
         let candidate = Atom {
             serial: 0,
             name: atom_name,
@@ -534,7 +616,34 @@ pub fn parse_pdb(id: &str, pdb_text: &str) -> Result<Biomolecule, BioStructError
     if title.is_empty() {
         title = id.to_string();
     }
-    finalize_biomolecule(id.to_string(), title, atoms, frames, is_af)
+    let mut mol = finalize_biomolecule(id.to_string(), title, atoms, frames, is_af)?;
+    mol.unit_cell = unit_cell;
+    mol.biomt_ops = biomt_rows
+        .into_iter()
+        .map(|(op_id, r)| crate::symmetry::SymmetryOp {
+            id: op_id,
+            matrix: [
+                [r[0][0], r[0][1], r[0][2]],
+                [r[1][0], r[1][1], r[1][2]],
+                [r[2][0], r[2][1], r[2][2]],
+            ],
+            translation: [r[0][3], r[1][3], r[2][3]],
+        })
+        .collect();
+    mol.altlocs = altloc_map
+        .into_iter()
+        .filter(|(_, v)| v.len() >= 2)
+        .map(
+            |((chain, res_seq, res_name, atom_name), alt_ids)| crate::symmetry::AltLocRecord {
+                chain,
+                res_seq,
+                res_name,
+                atom_name,
+                alt_ids,
+            },
+        )
+        .collect();
+    Ok(mol)
 }
 
 /// Parse mmCIF (`_atom_site` loop) into `Biomolecule`.
@@ -545,9 +654,58 @@ pub fn parse_mmcif(id: &str, cif_text: &str) -> Result<Biomolecule, BioStructErr
     let mut cols: Vec<String> = Vec::new();
     let mut in_atom_site = false;
     let mut atoms = Vec::new();
+    let mut cell_a = 0.0_f64;
+    let mut cell_b = 0.0_f64;
+    let mut cell_c = 0.0_f64;
+    let mut cell_al = 90.0_f64;
+    let mut cell_be = 90.0_f64;
+    let mut cell_ga = 90.0_f64;
+    let mut cell_sg = String::from("P 1");
 
     for raw in cif_text.lines() {
         let line = raw.trim();
+        if let Some(rest) = line.strip_prefix("_cell.length_a ") {
+            cell_a = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+        } else if let Some(rest) = line.strip_prefix("_cell.length_b ") {
+            cell_b = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+        } else if let Some(rest) = line.strip_prefix("_cell.length_c ") {
+            cell_c = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+        } else if let Some(rest) = line.strip_prefix("_cell.angle_alpha ") {
+            cell_al = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(90.0);
+        } else if let Some(rest) = line.strip_prefix("_cell.angle_beta ") {
+            cell_be = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(90.0);
+        } else if let Some(rest) = line.strip_prefix("_cell.angle_gamma ") {
+            cell_ga = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(90.0);
+        } else if let Some(rest) = line.strip_prefix("_symmetry.space_group_name_H-M ") {
+            let sg = rest.trim().trim_matches(['\'', '"']).to_string();
+            if !sg.is_empty() && sg != "?" && sg != "." {
+                cell_sg = sg;
+            }
+        }
         if line.is_empty() || line.starts_with('#') {
             if in_atom_site && !atoms.is_empty() {
                 break;
@@ -656,7 +814,19 @@ pub fn parse_mmcif(id: &str, cif_text: &str) -> Result<Biomolecule, BioStructErr
             is_hetatm: group == "HETATM",
         });
     }
-    finalize_biomolecule(id.to_string(), id.to_string(), atoms, Vec::new(), false)
+    let mut mol = finalize_biomolecule(id.to_string(), id.to_string(), atoms, Vec::new(), false)?;
+    if cell_a > 1.0 && cell_b > 1.0 && cell_c > 1.0 {
+        mol.unit_cell = Some(crate::symmetry::UnitCell {
+            a: cell_a,
+            b: cell_b,
+            c: cell_c,
+            alpha_deg: cell_al,
+            beta_deg: cell_be,
+            gamma_deg: cell_ga,
+            space_group: cell_sg,
+        });
+    }
+    Ok(mol)
 }
 
 /// Single parsed SDF record (3D ligand pose + preserved `<TAG>` properties).
