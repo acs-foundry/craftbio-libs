@@ -569,6 +569,206 @@ where
     mesh
 }
 
+/// Build a smooth variable-radius **B-Factor / pLDDT / RMSF Putty (Sausage)** tube mesh
+/// (PyMOL `cartoon putty` / ChimeraX `worm` equivalent): tube radius scales smoothly between
+/// `0.24 Å` and `1.08 Å` based on each guide residue's scalar B-factor/attribute value.
+pub fn build_putty_mesh<F>(mol: &Biomolecule, color_of_atom: F) -> TriangleMesh
+where
+    F: Fn(usize, SecondaryStructure) -> [f32; 3],
+{
+    const RING_SEGS: usize = 10;
+    const SUB_STEPS: usize = 5;
+    let mut mesh = TriangleMesh {
+        vertices: Vec::with_capacity(mol.atoms.len().min(40_000) * 2),
+        indices: Vec::with_capacity(mol.atoms.len().min(40_000) * 6),
+        is_transparent: false,
+        wireframe: false,
+    };
+
+    // Determine global B-factor range across polymer guide atoms
+    let mut b_min = f64::INFINITY;
+    let mut b_max = f64::NEG_INFINITY;
+    let mut b_sum = 0.0_f64;
+    let mut b_cnt = 0usize;
+    for ch in &mol.chains {
+        for r in &ch.residues {
+            if matches!(
+                r.class,
+                ResidueClass::Protein | ResidueClass::Rna | ResidueClass::Dna
+            ) && let Some(gi) = r.guide_idx
+            {
+                let b = mol.atoms[gi].b_factor;
+                if b.is_finite() {
+                    b_min = b_min.min(b);
+                    b_max = b_max.max(b);
+                    b_sum += b;
+                    b_cnt += 1;
+                }
+            }
+        }
+    }
+    let span = (b_max - b_min).max(1e-3);
+    // AlphaFold/Boltz pLDDT convention: high value (90-100) = rigid/slender, low value (<70) = flexible/thick
+    let is_plddt_like = b_cnt > 0 && b_max <= 100.5 && (b_sum / b_cnt as f64) > 55.0;
+
+    let radius_for_b = |b: f64| -> f32 {
+        if (b_max - b_min) < 1e-3 {
+            return 0.44;
+        }
+        let norm = ((b - b_min) / span).clamp(0.0, 1.0) as f32;
+        let flex = if is_plddt_like { 1.0 - norm } else { norm };
+        0.24 + 0.84 * flex
+    };
+
+    struct PuttyNode {
+        pos: [f32; 3],
+        radius: f32,
+        color: [f32; 3],
+        class: ResidueClass,
+    }
+
+    for ch in &mol.chains {
+        let mut nodes = Vec::with_capacity(ch.residues.len());
+        for r in &ch.residues {
+            if !matches!(
+                r.class,
+                ResidueClass::Protein | ResidueClass::Rna | ResidueClass::Dna
+            ) {
+                continue;
+            }
+            let Some(gi) = r.guide_idx else { continue };
+            let c = mol.atoms[gi].coords;
+            nodes.push(PuttyNode {
+                pos: [c[0] as f32, c[1] as f32, c[2] as f32],
+                radius: radius_for_b(mol.atoms[gi].b_factor),
+                color: color_of_atom(gi, r.ss),
+                class: r.class,
+            });
+        }
+        let mut seg_start = 0usize;
+        while seg_start < nodes.len() {
+            let mut seg_end = seg_start + 1;
+            while seg_end < nodes.len() {
+                let max_jump = if nodes[seg_end - 1].class == ResidueClass::Protein {
+                    5.3
+                } else {
+                    9.8
+                };
+                let d = sub3(nodes[seg_end].pos, nodes[seg_end - 1].pos);
+                if dot3(d, d).sqrt() > max_jump {
+                    break;
+                }
+                seg_end += 1;
+            }
+            let seg = &nodes[seg_start..seg_end];
+            if seg.len() >= 2 {
+                let mut stations: Vec<([f32; 3], f32, [f32; 3])> =
+                    Vec::with_capacity((seg.len() - 1) * SUB_STEPS + 1);
+                for i in 0..(seg.len() - 1) {
+                    let p0 = seg[i.saturating_sub(1)].pos;
+                    let p1 = seg[i].pos;
+                    let p2 = seg[i + 1].pos;
+                    let p3 = seg[(i + 2).min(seg.len() - 1)].pos;
+                    let steps = if i + 1 == seg.len() - 1 {
+                        SUB_STEPS
+                    } else {
+                        SUB_STEPS - 1
+                    };
+                    for s in 0..=steps {
+                        let t = (s as f32) / (SUB_STEPS as f32);
+                        let pos = catmull_rom(p0, p1, p2, p3, t);
+                        let rad = seg[i].radius + (seg[i + 1].radius - seg[i].radius) * t;
+                        let col = lerp3(seg[i].color, seg[i + 1].color, t);
+                        stations.push((pos, rad, col));
+                    }
+                }
+
+                let base_vert = mesh.vertices.len() as u32;
+                let mut prev_n = [0.0_f32, 1.0, 0.0];
+                for (si, &(pos, rad, col)) in stations.iter().enumerate() {
+                    let tang = if si == 0 {
+                        normalize3(sub3(stations[1].0, pos))
+                    } else if si + 1 == stations.len() {
+                        normalize3(sub3(pos, stations[si - 1].0))
+                    } else {
+                        normalize3(sub3(stations[si + 1].0, stations[si - 1].0))
+                    };
+                    let fb = sub3(prev_n, scale3(tang, dot3(prev_n, tang)));
+                    let nrm = if dot3(fb, fb) > 1e-5 {
+                        normalize3(fb)
+                    } else {
+                        let alt = if tang[1].abs() < 0.8 {
+                            [0.0, 1.0, 0.0]
+                        } else {
+                            [1.0, 0.0, 0.0]
+                        };
+                        normalize3(cross3(tang, alt))
+                    };
+                    prev_n = nrm;
+                    let binrm = normalize3(cross3(tang, nrm));
+                    for r in 0..RING_SEGS {
+                        let ang = (r as f32) * TAU / (RING_SEGS as f32);
+                        let ca = ang.cos();
+                        let sa = ang.sin();
+                        let vnrm = normalize3(add3(scale3(binrm, ca), scale3(nrm, sa)));
+                        let vpos = add3(pos, scale3(vnrm, rad));
+                        mesh.vertices.push(MeshVertex {
+                            position: vpos,
+                            normal: vnrm,
+                            color: [col[0], col[1], col[2], 1.0],
+                        });
+                    }
+                }
+                let stride = RING_SEGS as u32;
+                for si in 0..(stations.len().saturating_sub(1)) {
+                    let r0 = base_vert + (si as u32) * stride;
+                    let r1 = r0 + stride;
+                    for k in 0..stride {
+                        let kn = (k + 1) % stride;
+                        mesh.indices.extend_from_slice(&[
+                            r0 + k,
+                            r1 + k,
+                            r1 + kn,
+                            r0 + k,
+                            r1 + kn,
+                            r0 + kn,
+                        ]);
+                    }
+                }
+                if let (Some(first), Some(last)) = (stations.first(), stations.last()) {
+                    let start_c = mesh.vertices.len() as u32;
+                    let start_n = normalize3(sub3(first.0, stations[1].0));
+                    mesh.vertices.push(MeshVertex {
+                        position: first.0,
+                        normal: start_n,
+                        color: [first.2[0], first.2[1], first.2[2], 1.0],
+                    });
+                    for k in 0..stride {
+                        let kn = (k + 1) % stride;
+                        mesh.indices
+                            .extend_from_slice(&[start_c, base_vert + kn, base_vert + k]);
+                    }
+                    let end_ring = base_vert + ((stations.len() - 1) as u32) * stride;
+                    let end_c = mesh.vertices.len() as u32;
+                    let end_n = normalize3(sub3(last.0, stations[stations.len() - 2].0));
+                    mesh.vertices.push(MeshVertex {
+                        position: last.0,
+                        normal: end_n,
+                        color: [last.2[0], last.2[1], last.2[2], 1.0],
+                    });
+                    for k in 0..stride {
+                        let kn = (k + 1) % stride;
+                        mesh.indices
+                            .extend_from_slice(&[end_c, end_ring + k, end_ring + kn]);
+                    }
+                }
+            }
+            seg_start = seg_end;
+        }
+    }
+    mesh
+}
+
 /// Kuhn 6-tetrahedra decomposition of the unit cube `[0,1]^3` (100% crack-free watertight manifold).
 const KUHN_TETS: [[usize; 4]; 6] = [
     [0, 5, 1, 6],

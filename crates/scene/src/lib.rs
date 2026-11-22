@@ -31,6 +31,7 @@ pub enum SceneError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RepresentationKind {
     Cartoon,
+    Putty,
     NucleicLadder,
     Sticks,
     Spheres,
@@ -43,6 +44,7 @@ impl RepresentationKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Cartoon => "Cartoon / Ribbon",
+            Self::Putty => "B-Factor / Attribute Putty",
             Self::NucleicLadder => "RNA / DNA Ladder",
             Self::Sticks => "Sticks",
             Self::Spheres => "Spheres (VDW)",
@@ -255,6 +257,41 @@ pub struct LineOverlay {
     pub to: [f64; 3],
     pub dashed: bool,
     pub rgba: [f32; 4],
+}
+
+/// 3D world-space text annotation projected cleanly onto the GUI & burned into 4K PNGs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Label3D {
+    pub text: String,
+    pub coords: [f64; 3],
+    pub rgba: [f32; 4],
+    pub font_scale: f32,
+}
+
+/// 2D screen-space annotation at normalized `[0..1, 0..1]` coordinates (ChimeraX `2dlabels`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Label2D {
+    pub id: String,
+    pub text: String,
+    pub norm_pos: [f32; 2],
+    pub rgba: [f32; 4],
+    pub font_scale: f32,
+}
+
+/// Publication Color Key gradient legend bar (ChimeraX `key`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColorKeyLegend {
+    pub title: String,
+    pub min_label: String,
+    pub max_label: String,
+    pub stops: Vec<[f32; 3]>,
+}
+
+/// Calibrated Ångström Scale Bar specification (ChimeraX `scalebar`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScaleBarSpec {
+    pub length_a: f32,
+    pub label: String,
 }
 
 /// Scientific epistemic provenance category (aligned with `craft-anything` evidence discipline).

@@ -6,13 +6,14 @@
 pub mod align;
 pub mod analysis;
 pub mod io;
+pub mod measure;
 pub mod model;
 pub mod selection;
 pub mod volume;
 
 pub use align::{
-    RigidTransform, kabsch_superpose, matchmaker_align, needleman_wunsch_pairs,
-    smith_waterman_pairs,
+    RigidTransform, cealign_superpose, kabsch_superpose, matchmaker_align, morph_biomolecules,
+    needleman_wunsch_pairs, smith_waterman_pairs,
 };
 pub use analysis::{
     DipoleMomentReport, assign_secondary_structure, compute_dipole_moment, compute_esp_at_points,
@@ -21,6 +22,13 @@ pub use analysis::{
 pub use io::{
     SdfPoseRecord, finalize_biomolecule, load_dcd_frames, parse_fasta, parse_mmcif, parse_pdb,
     parse_sdf_poses, parse_structure_auto, write_mmcif, write_multi_model_pdb, write_pdb,
+};
+pub use measure::{
+    ClashRecord, ContactRecord, GeometryAxis, GeometryPlane, HBondRecord, MsaAlignment, MsaRow,
+    PaeMatrix, axis_angle_deg, build_synchronized_msa, compute_best_fit_plane,
+    compute_geometry_axis, detect_clashes, detect_contacts, detect_hbonds,
+    estimate_pae_proxy_from_structure, measure_angle_deg, measure_dihedral_deg, measure_distance,
+    parse_pae_json,
 };
 pub use model::{
     Atom, BasePair3D, BioStructError, Biomolecule, Bond, Chain, Disulfide, MAX_BIOMOL_ATOMS,
@@ -196,6 +204,158 @@ $$$$
         );
         assert_eq!(poses[0].molecule.bonds.len(), 1);
         assert_eq!(poses[0].molecule.bonds[0].order, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn wave5_measurements_hbonds_clashes_axes_planes_pae_and_msa() -> Result<(), BioStructError> {
+        let pdb = "\
+ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 92.00           N
+ATOM      2  CA  ALA A   1       1.450   0.000   0.000  1.00 92.00           C
+ATOM      3  C   ALA A   1       2.050   1.380   0.000  1.00 92.00           C
+ATOM      4  O   ALA A   1       1.400   2.400   0.000  1.00 92.00           O
+ATOM      5  N   GLY A   2       3.350   1.420   0.000  1.00 88.00           N
+ATOM      6  CA  GLY A   2       4.100   2.680   0.000  1.00 88.00           C
+ATOM      7  N   SER B   1       1.400   5.250   0.000  1.00 85.00           N
+ATOM      8  CA  SER B   1       2.500   6.150   0.000  1.00 85.00           C
+ATOM      9  CB  SER B   1       2.500   2.400   0.000  1.00 85.00           C
+END
+";
+        let mol = parse_pdb("w5_meas", pdb)?;
+
+        // Distance, Angle, Dihedral
+        assert!((measure_distance([0.0, 0.0, 0.0], [3.0, 4.0, 0.0]) - 5.0).abs() < 1e-6);
+        assert!(
+            (measure_angle_deg([1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]) - 90.0).abs()
+                < 1e-4
+        );
+        let dih = measure_dihedral_deg(
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0],
+        );
+        assert!((dih.abs() - 90.0).abs() < 1e-4);
+
+        // H-bond (A:ALA1.O at (1.4,2.4,0) to B:SER1.N at (1.4,5.25,0) => 2.85 A)
+        let hbs = detect_hbonds(&mol, None, None, 3.5, 90.0);
+        assert!(!hbs.is_empty(), "expected inter-chain H-bond near 2.85 A");
+
+        // Steric clash (A:ALA1.O at (1.4,2.4,0) vs B:SER1.CB at (2.5,2.4,0) => 1.1 A < vdw sum 3.22 A)
+        let clashes = detect_clashes(&mol, None, None, 0.6);
+        assert!(
+            !clashes.is_empty(),
+            "expected severe clash between A:1.O and B:1.CB"
+        );
+
+        // Contacts
+        let contacts = detect_contacts(&mol, None, None, 4.0, 50);
+        assert!(!contacts.is_empty());
+
+        // Axis & Plane PCA
+        let line_pts = [
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [5.0, 0.0, 0.1],
+            [8.0, 0.0, 0.0],
+        ];
+        let ax = compute_geometry_axis("helix1", &line_pts)?;
+        assert!(ax.length_a > 7.5 && ax.linearity_ratio > 0.98);
+        let plane_pts = [
+            [0.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [3.0, 3.0, 0.0],
+            [0.0, 3.0, 0.0],
+        ];
+        let pl = compute_best_fit_plane("ring1", &plane_pts)?;
+        assert!(pl.normal[2].abs() > 0.99 && pl.rms_deviation_a < 1e-4);
+        assert!((axis_angle_deg(ax.direction, pl.normal, true) - 90.0).abs() < 2.0);
+
+        // Synchronized MSA
+        let msa = build_synchronized_msa(&[("m1", &mol), ("m2", &mol)]);
+        assert_eq!(msa.rows.len(), 2);
+        assert!(msa.num_columns >= 2);
+        assert!(msa.column_conservation.iter().all(|&c| c > 0.99));
+
+        // AlphaFold / Boltz PAE JSON parser + structural proxy
+        let pae_json = r#"[{"predicted_aligned_error":[[0.5,1.2,18.0,19.0],[1.2,0.5,17.5,18.5],[18.0,17.5,0.6,1.1],[19.0,18.5,1.1,0.6]]}]"#;
+        let pae = parse_pae_json("af_test", pae_json)?;
+        assert_eq!(pae.length, 4);
+        assert!(pae.is_experimental_json && pae.max_pae >= 19.0);
+        let proxy = estimate_pae_proxy_from_structure(&mol);
+        assert!(proxy.length >= 2 && !proxy.is_experimental_json);
+        Ok(())
+    }
+
+    #[test]
+    fn wave5_cealign_zero_identity_and_conformational_morph() -> Result<(), BioStructError> {
+        // Build a 16-residue synthetic curved helix in mol_a, and a 0%-sequence-identity
+        // rotated+translated copy in mol_b to prove sequence-independent CE alignment!
+        let mut pdb_a = String::new();
+        let mut pdb_b = String::new();
+        let mut pdb_bent = String::new();
+        let aa_a = [
+            "ALA", "VAL", "LEU", "ILE", "MET", "PHE", "TRP", "PRO", "GLY", "SER", "THR", "CYS",
+            "TYR", "ASN", "GLN", "ASP",
+        ];
+        let aa_b = [
+            "GLU", "LYS", "ARG", "HIS", "ALA", "VAL", "LEU", "ILE", "MET", "PHE", "TRP", "PRO",
+            "GLY", "SER", "THR", "CYS",
+        ];
+        for i in 0..16usize {
+            let t = i as f64;
+            let x = t * 1.5;
+            let y = 2.3 * (t * 1.745).cos();
+            let z = 2.3 * (t * 1.745).sin();
+            pdb_a.push_str(&format!(
+                "ATOM  {:5}  CA  {} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 90.00           C\n",
+                i + 1,
+                aa_a[i],
+                i + 1,
+                x,
+                y,
+                z
+            ));
+            // Rotate 90 deg around Z and translate by (25, -14, 9) with 0% sequence identity!
+            let rx = -y + 25.0;
+            let ry = x - 14.0;
+            let rz = z + 9.0;
+            pdb_b.push_str(&format!(
+                "ATOM  {:5}  CA  {} B{:4}    {:8.3}{:8.3}{:8.3}  1.00 85.00           C\n",
+                i + 1,
+                aa_b[i],
+                i + 101,
+                rx,
+                ry,
+                rz
+            ));
+            // Bent conformation for morph (second half swings in Y)
+            let by = if i >= 8 { y + (i - 7) as f64 * 1.4 } else { y };
+            pdb_bent.push_str(&format!(
+                "ATOM  {:5}  CA  {} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 90.00           C\n",
+                i + 1,
+                aa_a[i],
+                i + 1,
+                x,
+                by,
+                z
+            ));
+        }
+        let mol_a = parse_pdb("helix_a", &pdb_a)?;
+        let mut mol_b = parse_pdb("helix_b_0id", &pdb_b)?;
+        let tf = cealign_superpose(&mut mol_b, 'B', &mol_a, 'A')?;
+        assert!(
+            tf.rmsd_a < 0.05 && tf.aligned_pairs >= 14,
+            "expected near-exact sequence-independent cealign, got RMSD={} on {} atoms",
+            tf.rmsd_a,
+            tf.aligned_pairs
+        );
+
+        let mol_bent = parse_pdb("helix_bent", &pdb_bent)?;
+        let morphed = morph_biomolecules(&mol_a, &mol_bent, 12)?;
+        assert_eq!(morphed.frames.len(), 12);
+        assert!(dist3(morphed.frames[0].coords[15], mol_a.atoms[15].coords) < 1e-6);
+        assert!(dist3(morphed.frames[11].coords[15], morphed.frames[0].coords[15]) > 2.0);
         Ok(())
     }
 }

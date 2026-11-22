@@ -9,6 +9,8 @@ pub mod geometry;
 pub mod gpu_renderer;
 pub mod headless_png;
 pub mod mesh;
+pub mod movie;
+pub mod overlay_2d;
 
 pub use camera::{Camera3D, cross3, dot3, normalize3};
 pub use geometry::{
@@ -18,8 +20,15 @@ pub use geometry::{
 pub use gpu_renderer::{SharedViewportScene, show_biomol_viewport};
 pub use headless_png::{RenderError, render_scene_png_bytes, render_scene_rgba, write_scene_png};
 pub use mesh::{
-    MeshVertex, TriangleMesh, build_cartoon_mesh, build_ses_surface_mesh, export_meshes_to_glb,
-    export_meshes_to_obj, extract_isosurface_mesh,
+    MeshVertex, TriangleMesh, build_cartoon_mesh, build_putty_mesh, build_ses_surface_mesh,
+    export_meshes_to_glb, export_meshes_to_obj, extract_isosurface_mesh,
+};
+pub use movie::{
+    encode_gif89a, interpolate_camera, render_fly_frames, render_rock_frames,
+    render_turntable_frames, write_movie_file,
+};
+pub use overlay_2d::{
+    composite_2d_overlays, pixels_per_angstrom_at_target, project_world_to_screen,
 };
 
 #[cfg(test)]
@@ -112,6 +121,69 @@ END
         assert_ne!(raw, clipped_bytes);
 
         let _ = std::fs::remove_file(&out);
+        Ok(())
+    }
+
+    #[test]
+    fn wave5_putty_mesh_overlays_color_key_scalebar_and_gif89a_movie()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use craftbio_scene::{ColorKeyLegend, Label2D, Label3D, ScaleBarSpec};
+        let pdb = "\
+ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 95.00           C
+ATOM      2  CA  GLY A   2       3.800   0.400   0.200  1.00 82.00           C
+ATOM      3  CA  SER A   3       7.500   1.200  -0.300  1.00 60.00           C
+ATOM      4  CA  TYR A   4      11.200   0.800   0.500  1.00 42.00           C
+END
+";
+        let mol = parse_pdb("w5_putty", pdb)?;
+        let opts = RenderOptions {
+            representation: RepresentationKind::Putty,
+            color_scheme: ColorScheme::BfactorPlddt,
+            labels_3d: vec![Label3D {
+                text: "A:TYR4 3.1 A".to_string(),
+                coords: [11.2, 0.8, 0.5],
+                rgba: [1.0, 0.92, 0.25, 1.0],
+                font_scale: 1.0,
+            }],
+            labels_2d: vec![Label2D {
+                id: "title".to_string(),
+                text: "WAVE 5 PUTTY TEST".to_string(),
+                norm_pos: [0.04, 0.04],
+                rgba: [0.95, 0.98, 1.0, 1.0],
+                font_scale: 1.0,
+            }],
+            color_key: Some(ColorKeyLegend {
+                title: "pLDDT".to_string(),
+                min_label: "40".to_string(),
+                max_label: "100".to_string(),
+                stops: vec![[0.98, 0.48, 0.25], [0.99, 0.84, 0.22], [0.05, 0.35, 0.86]],
+            }),
+            scale_bar: Some(ScaleBarSpec {
+                length_a: 10.0,
+                label: "10 A".to_string(),
+            }),
+            ..RenderOptions::default()
+        };
+        let scene = build_render_scene(&mol, &opts);
+        assert!(
+            !scene.opaque_meshes.is_empty(),
+            "expected triangulated Putty tube mesh"
+        );
+        let mut cam = Camera3D::default();
+        cam.focus_on_biomolecule(&mol);
+        let png_bytes = render_scene_png_bytes(&scene, &cam, 320, 240, false)?;
+        assert!(png_bytes.len() > 2000 && &png_bytes[..8] == b"\x89PNG\r\n\x1a\n");
+
+        // Render 6-frame turntable GIF89a movie (pure Rust, zero external crates!)
+        let frames = render_turntable_frames(&scene, &cam, 160, 120, 6)?;
+        assert_eq!(frames.len(), 6);
+        let gif_path = std::env::temp_dir().join(format!("craftbio_w5_{}.gif", std::process::id()));
+        let gif_len = write_movie_file(&gif_path, 160, 120, 10, &frames)?;
+        assert!(gif_len > 1000);
+        let gif_raw = std::fs::read(&gif_path)?;
+        assert_eq!(&gif_raw[..6], b"GIF89a");
+        assert_eq!(gif_raw.last().copied(), Some(0x3B));
+        let _ = std::fs::remove_file(&gif_path);
         Ok(())
     }
 }

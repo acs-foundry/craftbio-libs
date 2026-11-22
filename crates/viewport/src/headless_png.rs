@@ -642,6 +642,24 @@ pub fn render_scene_rgba(
     for mut r in final_rows {
         out.append(&mut r);
     }
+
+    // Pass 4: Crisp 3D/2D labels, publication Color Key legend, and calibrated Scale Bar
+    if !scene.labels_3d.is_empty()
+        || !scene.labels_2d.is_empty()
+        || scene.color_key.is_some()
+        || scene.scale_bar.is_some()
+    {
+        crate::overlay_2d::composite_2d_overlays(
+            &mut out,
+            width,
+            height,
+            camera,
+            &scene.labels_3d,
+            &scene.labels_2d,
+            scene.color_key.as_ref(),
+            scene.scale_bar.as_ref(),
+        );
+    }
     Ok(out)
 }
 

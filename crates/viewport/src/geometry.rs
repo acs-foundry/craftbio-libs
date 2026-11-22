@@ -9,7 +9,8 @@ use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
 use craftbio_scene::{
-    ColorScheme, GridBox3D, LightingPreset, LineOverlay, RepresentationKind, SphereOverlay,
+    ColorKeyLegend, ColorScheme, GridBox3D, Label2D, Label3D, LightingPreset, LineOverlay,
+    RepresentationKind, ScaleBarSpec, SphereOverlay,
 };
 use craftbio_struct::{
     Biomolecule, ResidueClass, SecondaryStructure, VolumeGrid3D, compute_esp_at_points,
@@ -17,8 +18,8 @@ use craftbio_struct::{
 };
 
 use crate::mesh::{
-    TriangleMesh, build_cartoon_mesh, build_ses_surface_mesh, export_meshes_to_glb,
-    export_meshes_to_obj, extract_isosurface_mesh,
+    TriangleMesh, build_cartoon_mesh, build_putty_mesh, build_ses_surface_mesh,
+    export_meshes_to_glb, export_meshes_to_obj, extract_isosurface_mesh,
 };
 
 /// Single GPU ray-cast sphere impostor instance.
@@ -52,6 +53,10 @@ pub struct RenderSceneData {
     pub lighting: LightingPreset,
     pub ssao_strength: f32,
     pub show_silhouettes: bool,
+    pub labels_3d: Vec<Label3D>,
+    pub labels_2d: Vec<Label2D>,
+    pub color_key: Option<ColorKeyLegend>,
+    pub scale_bar: Option<ScaleBarSpec>,
 }
 
 impl Default for RenderSceneData {
@@ -65,6 +70,10 @@ impl Default for RenderSceneData {
             lighting: LightingPreset::Soft,
             ssao_strength: 0.55,
             show_silhouettes: true,
+            labels_3d: Vec::new(),
+            labels_2d: Vec::new(),
+            color_key: None,
+            scale_bar: None,
         }
     }
 }
@@ -77,6 +86,14 @@ impl RenderSceneData {
             .append(&mut other.transparent_meshes);
         self.spheres.append(&mut other.spheres);
         self.capsules.append(&mut other.capsules);
+        self.labels_3d.append(&mut other.labels_3d);
+        self.labels_2d.append(&mut other.labels_2d);
+        if self.color_key.is_none() {
+            self.color_key = other.color_key;
+        }
+        if self.scale_bar.is_none() {
+            self.scale_bar = other.scale_bar;
+        }
     }
 
     /// Export all triangulated meshes in this scene to binary glTF 2.0 (`.glb`).
@@ -132,6 +149,11 @@ pub struct RenderOptions {
     pub volume_grid: Option<VolumeGrid3D>,
     pub volume_sigma: f64,
     pub volume_wireframe: bool,
+    /// Optional 3D/2D publication labels, color key legend, and calibrated Ångström scale bar.
+    pub labels_3d: Vec<Label3D>,
+    pub labels_2d: Vec<Label2D>,
+    pub color_key: Option<ColorKeyLegend>,
+    pub scale_bar: Option<ScaleBarSpec>,
 }
 
 impl Default for RenderOptions {
@@ -157,6 +179,10 @@ impl Default for RenderOptions {
             volume_grid: None,
             volume_sigma: 1.5,
             volume_wireframe: false,
+            labels_3d: Vec::new(),
+            labels_2d: Vec::new(),
+            color_key: None,
+            scale_bar: None,
         }
     }
 }
@@ -293,6 +319,10 @@ pub fn build_render_scene(mol: &Biomolecule, opts: &RenderOptions) -> RenderScen
         lighting: opts.lighting,
         ssao_strength: opts.ssao_strength,
         show_silhouettes: opts.show_silhouettes,
+        labels_3d: opts.labels_3d.clone(),
+        labels_2d: opts.labels_2d.clone(),
+        color_key: opts.color_key.clone(),
+        scale_bar: opts.scale_bar.clone(),
     };
 
     let sap_vals = if opts.color_scheme == ColorScheme::Sap3D {
@@ -409,6 +439,14 @@ pub fn build_render_scene(mol: &Biomolecule, opts: &RenderOptions) -> RenderScen
                     });
                 }
             }
+        }
+    }
+
+    // 1B. Variable-radius B-Factor / pLDDT / RMSF Putty (Sausage) tube
+    if opts.representation == RepresentationKind::Putty {
+        let putty_mesh = build_putty_mesh(mol, atom_color);
+        if !putty_mesh.indices.is_empty() {
+            scene.opaque_meshes.push(putty_mesh);
         }
     }
 
