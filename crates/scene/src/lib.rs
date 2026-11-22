@@ -1,12 +1,20 @@
 #![forbid(unsafe_code)]
 
-//! `craftbio-scene` — Portable `.craftscene.json` Biomolecular Interchange, Scientific Provenance
-//! Log (aligned with `craft-anything`), and **Craft Link v1** Inter-App IPC over `storytold/craft-libs`'s `craft-ipc`.
+//! `craftbio-scene` — Portable `.craftscene.json` & Verified `.biomol.zip` Biomolecular Interchange,
+//! Scientific Provenance Log (aligned with `craft-anything`), and **Craft Link v1** Inter-App IPC
+//! over `storytold/craft-libs`'s `craft-ipc` (CraftBio ↔ ArtCraft Suite).
+
+pub mod archive;
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, RwLock};
 
+pub use archive::{
+    MAX_ARCHIVE_ENTRIES, MAX_ARCHIVE_UNCOMPRESSED_BYTES, read_verified_zip,
+    read_verified_zip_bytes, read_verified_zip_bytes_with_limit, validate_entry_name,
+    write_verified_zip, write_verified_zip_bytes,
+};
 use craft_ipc::client::Client;
 use craft_ipc::discovery::{Discovery, InstanceRecord, RuntimeDir};
 use craft_ipc::error::LinkError;
@@ -23,6 +31,8 @@ pub enum SceneError {
     Json(#[from] serde_json::Error),
     #[error("Craft Link IPC error: {0}")]
     Link(#[from] LinkError),
+    #[error("Archive integrity error: {0}")]
+    Archive(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -350,6 +360,69 @@ impl Default for CraftSceneDocument {
     }
 }
 
+/// Target application in the ArtCraft Productivity Suite for live Craft Link v1 bundle push.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArtCraftTarget {
+    WordCraft,
+    DeckCraft,
+    GridCraft,
+}
+
+impl ArtCraftTarget {
+    #[must_use]
+    pub fn app_id(self) -> &'static str {
+        match self {
+            Self::WordCraft => "wordcraft",
+            Self::DeckCraft => "deckcraft",
+            Self::GridCraft => "gridcraft",
+        }
+    }
+
+    #[must_use]
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::WordCraft => "WordCraft",
+            Self::DeckCraft => "DeckCraft",
+            Self::GridCraft => "GridCraft",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "wordcraft" | "word" | "wc" | "manuscript" => Some(Self::WordCraft),
+            "deckcraft" | "deck" | "dc" | "slides" => Some(Self::DeckCraft),
+            "gridcraft" | "grid" | "gc" | "table" | "tsv" => Some(Self::GridCraft),
+            _ => None,
+        }
+    }
+}
+
+/// Complete scientific asset bundle pushed from CraftBio to ArtCraft (`WordCraft`/`DeckCraft`/`GridCraft`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtCraftPushPayload {
+    pub target: ArtCraftTarget,
+    pub title: String,
+    pub source_app: String,
+    pub bundle_dir: String,
+    pub figure_png_path: String,
+    pub markdown_path: String,
+    pub table_tsv_path: String,
+    pub summary_markdown: String,
+}
+
+/// Outcome of pushing a CraftBio figure/table/slide bundle to an ArtCraft Suite peer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtCraftPushResult {
+    pub target: ArtCraftTarget,
+    pub target_app: String,
+    pub live_pushed: bool,
+    pub peer_pid: Option<u32>,
+    pub bundle_dir: String,
+    pub primary_file: String,
+    pub message: String,
+}
+
 /// Inbound Craft Link command received from a peer CraftBio / ArtCraft application.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InboundLinkCommand {
@@ -365,6 +438,7 @@ pub enum InboundLinkCommand {
     },
     LoadScene(Box<CraftSceneDocument>),
     LoadDockCraftBundle(Box<DockCraftSceneBundle>),
+    ImportArtCraftBundle(Box<ArtCraftPushPayload>),
     RunDsl {
         command: String,
         source_app: String,
@@ -484,6 +558,24 @@ impl ControlSink for QueueSink {
                         }
                     }
                     Err(_) => json!({ "ok": false, "error": "selection box state unavailable" }),
+                }
+            }
+            "artcraft.import_bundle" => {
+                match serde_json::from_value::<ArtCraftPushPayload>(params) {
+                    Ok(payload) => {
+                        let target = payload.target.app_id().to_string();
+                        let title = payload.title.clone();
+                        if let Ok(mut q) = self.inbox.lock() {
+                            q.push(InboundLinkCommand::ImportArtCraftBundle(Box::new(payload)));
+                        }
+                        json!({
+                            "ok": true,
+                            "result": { "queued": true, "target": target, "title": title }
+                        })
+                    }
+                    Err(e) => {
+                        json!({ "ok": false, "error": format!("invalid ArtCraftPushPayload: {e}") })
+                    }
                 }
             }
             "biomol.run_dsl" => {
@@ -744,6 +836,75 @@ pub fn push_pdb_to_live_biomolcraft(
     send_open_pdb_via_craft_link(target, source_app, pdb_path, module_hint)
 }
 
+/// Push a rendered figure + scientific table + Markdown bundle to a live ArtCraft app
+/// (`WordCraft`, `DeckCraft`, `GridCraft`) over Craft Link v1, with graceful staged fallback
+/// when the target ArtCraft peer is not currently running.
+pub fn push_to_artcraft_via_craft_link(
+    runtime: Option<RuntimeDir>,
+    payload: &ArtCraftPushPayload,
+) -> Result<ArtCraftPushResult, SceneError> {
+    let app_id = payload.target.app_id();
+    let primary_file = match payload.target {
+        ArtCraftTarget::GridCraft => payload.table_tsv_path.clone(),
+        ArtCraftTarget::WordCraft | ArtCraftTarget::DeckCraft => payload.markdown_path.clone(),
+    };
+    let peers = discover_craft_instances(runtime, Some(app_id)).unwrap_or_default();
+    if let Some(peer) = peers.first() {
+        let params = serde_json::to_value(payload)?;
+        match Client::connect(peer).and_then(|mut c| c.call("artcraft.import_bundle", params)) {
+            Ok(_) => {
+                return Ok(ArtCraftPushResult {
+                    target: payload.target,
+                    target_app: app_id.to_string(),
+                    live_pushed: true,
+                    peer_pid: Some(peer.pid),
+                    bundle_dir: payload.bundle_dir.clone(),
+                    primary_file: primary_file.clone(),
+                    message: format!(
+                        "Live-pushed '{}' to {} (PID {}) over Craft Link v1; bundle saved at {}",
+                        payload.title,
+                        payload.target.display_name(),
+                        peer.pid,
+                        payload.bundle_dir
+                    ),
+                });
+            }
+            Err(err) => {
+                return Ok(ArtCraftPushResult {
+                    target: payload.target,
+                    target_app: app_id.to_string(),
+                    live_pushed: false,
+                    peer_pid: Some(peer.pid),
+                    bundle_dir: payload.bundle_dir.clone(),
+                    primary_file: primary_file.clone(),
+                    message: format!(
+                        "Staged {} bundle at {} (live Craft Link peer PID {} declined RPC: {err}); open {}",
+                        payload.target.display_name(),
+                        payload.bundle_dir,
+                        peer.pid,
+                        primary_file
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(ArtCraftPushResult {
+        target: payload.target,
+        target_app: app_id.to_string(),
+        live_pushed: false,
+        peer_pid: None,
+        bundle_dir: payload.bundle_dir.clone(),
+        primary_file: primary_file.clone(),
+        message: format!(
+            "Staged {} bundle at {} (no live `{app_id}` peer detected on Craft Link v1); ready to import {}",
+            payload.target.display_name(),
+            payload.bundle_dir,
+            primary_file
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -839,6 +1000,104 @@ mod tests {
         let cmds = srv.drain_inbox();
         assert_eq!(cmds.len(), 4);
         srv.shutdown();
+        let _ = std::fs::remove_dir_all(&dir_path);
+        Ok(())
+    }
+
+    #[test]
+    fn wave7_verified_zip_roundtrip_crc_and_security_guards()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = br#"{"schema_version":"biomol-session/v1","models":2}"#;
+        let pdb =
+            "ATOM      1  CA  ALA A   1       1.000   2.000   3.000  1.00 90.00           C\n"
+                .repeat(64);
+        let zip_bytes = write_verified_zip_bytes(&[
+            ("manifest.json", manifest.as_slice()),
+            ("models/m1.pdb", pdb.as_bytes()),
+        ])?;
+        // Standard PKZIP Local File Header magic
+        assert_eq!(&zip_bytes[0..4], b"PK\x03\x04");
+        // Deflate should achieve high compression on repetitive PDB lines
+        assert!(zip_bytes.len() < pdb.len() / 2);
+
+        let extracted = read_verified_zip_bytes(&zip_bytes)?;
+        assert_eq!(extracted.len(), 2);
+        assert_eq!(
+            extracted.get("manifest.json").map(Vec::as_slice),
+            Some(manifest.as_slice())
+        );
+        assert_eq!(
+            extracted.get("models/m1.pdb").map(Vec::as_slice),
+            Some(pdb.as_bytes())
+        );
+
+        // Guard 1: Path traversal rejected on write and validation
+        assert!(write_verified_zip_bytes(&[("../evil.txt", b"boom")]).is_err());
+        assert!(validate_entry_name("/etc/passwd").is_err());
+        assert!(validate_entry_name("models/../escape.pdb").is_err());
+
+        // Guard 2: Corrupted CRC-32 / payload rejected on read
+        let mut tampered = zip_bytes.clone();
+        // Flip a bit in the central directory CRC of the first entry
+        if let Some(pos) = tampered.windows(4).position(|w| w == b"PK\x01\x02") {
+            tampered[pos + 16] ^= 0xFF;
+        }
+        assert!(
+            read_verified_zip_bytes(&tampered).is_err(),
+            "tampered CRC-32 must be rejected"
+        );
+
+        // Guard 3: Decompression-bomb byte ceiling rejects oversized payloads
+        assert!(
+            read_verified_zip_bytes_with_limit(&zip_bytes, 128).is_err(),
+            "decompression bomb cap must reject archive exceeding budget"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wave7_artcraft_live_push_ipc_and_staged_fallback() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir_path =
+            std::env::temp_dir().join(format!("craftbio_artcraft_ipc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir_path);
+        std::fs::create_dir_all(&dir_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir_path, std::fs::Permissions::from_mode(0o700))?;
+        }
+
+        let runtime = RuntimeDir::at(dir_path.clone())?;
+        let payload = ArtCraftPushPayload {
+            target: ArtCraftTarget::WordCraft,
+            title: "HER2-Trastuzumab Structural Figure".to_string(),
+            source_app: "biomolcraft".to_string(),
+            bundle_dir: "/tmp/bundle".to_string(),
+            figure_png_path: "/tmp/bundle/figure.png".to_string(),
+            markdown_path: "/tmp/bundle/wordcraft.md".to_string(),
+            table_tsv_path: "/tmp/bundle/gridcraft.tsv".to_string(),
+            summary_markdown: "# HER2".to_string(),
+        };
+
+        // 1. Staged fallback when no live WordCraft peer is running
+        let staged = push_to_artcraft_via_craft_link(Some(runtime.clone()), &payload)?;
+        assert!(!staged.live_pushed);
+        assert!(staged.peer_pid.is_none());
+
+        // 2. Live push when a WordCraft peer is running on Craft Link v1
+        let word_srv = CraftBioLinkServer::start("wordcraft", "1.0.0", Some(runtime.clone()))?;
+        let live = push_to_artcraft_via_craft_link(Some(runtime), &payload)?;
+        assert!(live.live_pushed);
+        assert!(live.peer_pid.is_some());
+        let inbox = word_srv.drain_inbox();
+        assert_eq!(inbox.len(), 1);
+        assert!(matches!(
+            inbox[0],
+            InboundLinkCommand::ImportArtCraftBundle(_)
+        ));
+
+        word_srv.shutdown();
         let _ = std::fs::remove_dir_all(&dir_path);
         Ok(())
     }

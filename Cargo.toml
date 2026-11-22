@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "1.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
@@ -36,8 +36,10 @@ craftbio-scene = { path = "crates/scene" }
 
 # Standard Rust ecosystem crates (offline-cached)
 bytemuck = { version = "1", features = ["derive"] }
+crc32fast = "1.5"
 egui = "0.31"
 egui-wgpu = "0.31"
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 png = "0.18"
 rayon = "1.10"
 rustix = { version = "1", features = ["fs"] }

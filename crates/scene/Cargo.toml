@@ -5,13 +5,15 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "CraftBio .craftscene.json interchange, provenance/evidence records, and Craft Link v1 inter-app IPC built on storytold/craft-libs craft-ipc"
+description = "CraftBio .craftscene.json & verified .biomol.zip interchange, provenance/evidence records, and Craft Link v1 inter-app IPC built on storytold/craft-libs craft-ipc"
 
 [lints]
 workspace = true
 
 [dependencies]
 craft-ipc.workspace = true
+crc32fast.workspace = true
+flate2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
