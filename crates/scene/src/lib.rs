@@ -408,6 +408,8 @@ pub struct ArtCraftPushPayload {
     pub figure_png_path: String,
     pub markdown_path: String,
     pub table_tsv_path: String,
+    #[serde(default)]
+    pub native_doc_path: Option<String>,
     pub summary_markdown: String,
 }
 
@@ -420,6 +422,8 @@ pub struct ArtCraftPushResult {
     pub peer_pid: Option<u32>,
     pub bundle_dir: String,
     pub primary_file: String,
+    #[serde(default)]
+    pub native_doc_path: Option<String>,
     pub message: String,
 }
 
@@ -844,10 +848,20 @@ pub fn push_to_artcraft_via_craft_link(
     payload: &ArtCraftPushPayload,
 ) -> Result<ArtCraftPushResult, SceneError> {
     let app_id = payload.target.app_id();
-    let primary_file = match payload.target {
+    let fallback_file = match payload.target {
         ArtCraftTarget::GridCraft => payload.table_tsv_path.clone(),
         ArtCraftTarget::WordCraft | ArtCraftTarget::DeckCraft => payload.markdown_path.clone(),
     };
+    let primary_file = payload
+        .native_doc_path
+        .clone()
+        .unwrap_or_else(|| fallback_file.clone());
+    let native_note = payload
+        .native_doc_path
+        .as_deref()
+        .map_or_else(String::new, |p| {
+            format!(" [compiled native Office doc: {p}]")
+        });
     let peers = discover_craft_instances(runtime, Some(app_id)).unwrap_or_default();
     if let Some(peer) = peers.first() {
         let params = serde_json::to_value(payload)?;
@@ -860,8 +874,9 @@ pub fn push_to_artcraft_via_craft_link(
                     peer_pid: Some(peer.pid),
                     bundle_dir: payload.bundle_dir.clone(),
                     primary_file: primary_file.clone(),
+                    native_doc_path: payload.native_doc_path.clone(),
                     message: format!(
-                        "Live-pushed '{}' to {} (PID {}) over Craft Link v1; bundle saved at {}",
+                        "Live-pushed '{}' to {} (PID {}) over Craft Link v1; bundle saved at {}{native_note}",
                         payload.title,
                         payload.target.display_name(),
                         peer.pid,
@@ -877,12 +892,12 @@ pub fn push_to_artcraft_via_craft_link(
                     peer_pid: Some(peer.pid),
                     bundle_dir: payload.bundle_dir.clone(),
                     primary_file: primary_file.clone(),
+                    native_doc_path: payload.native_doc_path.clone(),
                     message: format!(
-                        "Staged {} bundle at {} (live Craft Link peer PID {} declined RPC: {err}); open {}",
+                        "Staged {} bundle at {} (live Craft Link peer PID {} declined RPC: {err}); ready to open {primary_file}{native_note}",
                         payload.target.display_name(),
                         payload.bundle_dir,
                         peer.pid,
-                        primary_file
                     ),
                 });
             }
@@ -896,11 +911,11 @@ pub fn push_to_artcraft_via_craft_link(
         peer_pid: None,
         bundle_dir: payload.bundle_dir.clone(),
         primary_file: primary_file.clone(),
+        native_doc_path: payload.native_doc_path.clone(),
         message: format!(
-            "Staged {} bundle at {} (no live `{app_id}` peer detected on Craft Link v1); ready to import {}",
+            "Staged {} bundle at {} (no live `{app_id}` peer detected on Craft Link v1); ready to open {primary_file}{native_note}",
             payload.target.display_name(),
             payload.bundle_dir,
-            primary_file
         ),
     })
 }
@@ -1077,6 +1092,7 @@ mod tests {
             figure_png_path: "/tmp/bundle/figure.png".to_string(),
             markdown_path: "/tmp/bundle/wordcraft.md".to_string(),
             table_tsv_path: "/tmp/bundle/gridcraft.tsv".to_string(),
+            native_doc_path: Some("/tmp/bundle/report_wordcraft.docx".to_string()),
             summary_markdown: "# HER2".to_string(),
         };
 

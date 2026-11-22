@@ -8,7 +8,8 @@ pub mod dossier;
 use std::path::PathBuf;
 
 pub use dossier::{
-    ArtCraftBundleSummary, HtmlDossierSummary, export_artcraft_bundle, write_biomol_html_dossier,
+    ArtCraftBundleSummary, HtmlDossierSummary, export_artcraft_bundle, resolve_artcraft_cli,
+    write_biomol_html_dossier,
 };
 
 /// Resolve the shared CraftBio local data directory (`CRAFT_DATA_DIR` or `/home/acs/Datos/CraftBio`).
