@@ -1,8 +1,13 @@
 #![forbid(unsafe_code)]
 
-//! Pure-Rust `wgpu 24 + WGSL` Instanced GPU Biomolecular 3D Renderer (`egui_wgpu::CallbackTrait`).
-//! Renders mathematically smooth ray-cast Sphere Impostors + Capsule/Cylinder Ribbons & Bonds
-//! with ChimeraX-inspired studio lighting, specular highlights, depth fog, and silhouette edges.
+//! Pure-Rust `wgpu 24 + WGSL` Offscreen `Depth32Float` Biomolecular 3D Renderer (`egui_wgpu::CallbackTrait`).
+//! - Pass 1 (Offscreen `Bgra8Unorm + Depth32Float` in `prepare()`):
+//!   - Indexed `MeshVertex` Opaque Pipeline (Cartoon ribbons, β-sheet arrowheads, RNA slabs, opaque SES)
+//!   - Analytical Ray-Cast Sphere & Capsule Pipelines with exact `@builtin(frag_depth)` + Near/Far Clip
+//!   - Transparent Mesh + Wireframe `LineList` Pipeline & Translucent Overlay Spheres (depth test ON, write OFF)
+//! - Pass 2 (Screen-Space Post-Process in `paint()`):
+//!   - 12-tap Poisson-disk **SSAO (Ambient Occlusion)** + ChimeraX-style **Depth-Discontinuity Silhouettes**
+//!     reading `(offscreen_color, offscreen_depth)` via `textureLoad` and blitting directly into `egui`.
 
 use std::sync::{Arc, RwLock};
 
@@ -12,6 +17,7 @@ use wgpu::util::DeviceExt;
 
 use crate::camera::Camera3D;
 use crate::geometry::{CapsuleInstance, RenderSceneData, SphereInstance};
+use crate::mesh::MeshVertex;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -19,30 +25,163 @@ struct Uniforms {
     view_proj: [[f32; 4]; 4],
     cam_right: [f32; 4],
     cam_up: [f32; 4],
+    cam_fwd: [f32; 4],
     cam_eye: [f32; 4],
-    fog_params: [f32; 4], // [z_ref, show_silhouettes, 0, 0]
+    /// `[clip_near, clip_far, z_ref, ssao_strength]`
+    clip_params: [f32; 4],
+    /// `[lighting_preset_id, show_silhouettes, viewport_w, viewport_h]`
+    light_params: [f32; 4],
+}
+
+struct OffscreenTarget {
+    width: u32,
+    height: u32,
+    color_tex: wgpu::Texture,
+    color_view: wgpu::TextureView,
+    depth_tex: wgpu::Texture,
+    depth_view: wgpu::TextureView,
+    post_bg: wgpu::BindGroup,
 }
 
 struct GpuBiomolResources {
-    sphere_pipeline: wgpu::RenderPipeline,
+    mesh_opaque_pipeline: wgpu::RenderPipeline,
+    mesh_transp_pipeline: wgpu::RenderPipeline,
+    mesh_wire_pipeline: wgpu::RenderPipeline,
+    sphere_opaque_pipeline: wgpu::RenderPipeline,
+    sphere_transp_pipeline: wgpu::RenderPipeline,
     capsule_pipeline: wgpu::RenderPipeline,
+    post_pipeline: wgpu::RenderPipeline,
+    post_bgl: wgpu::BindGroupLayout,
     uniform_buf: wgpu::Buffer,
     uniform_bg: wgpu::BindGroup,
-    sphere_buf: wgpu::Buffer,
-    sphere_cap: usize,
-    sphere_count: u32,
+
+    // Dynamic vertex/index/instance buffers
+    opaque_vbuf: wgpu::Buffer,
+    opaque_vcap: usize,
+    opaque_ibuf: wgpu::Buffer,
+    opaque_icap: usize,
+    opaque_icount: u32,
+
+    transp_vbuf: wgpu::Buffer,
+    transp_vcap: usize,
+    transp_ibuf: wgpu::Buffer,
+    transp_icap: usize,
+    transp_icount: u32,
+
+    wire_vbuf: wgpu::Buffer,
+    wire_vcap: usize,
+    wire_ibuf: wgpu::Buffer,
+    wire_icap: usize,
+    wire_icount: u32,
+
+    sphere_opaque_buf: wgpu::Buffer,
+    sphere_opaque_cap: usize,
+    sphere_opaque_count: u32,
+
+    sphere_transp_buf: wgpu::Buffer,
+    sphere_transp_cap: usize,
+    sphere_transp_count: u32,
+
     capsule_buf: wgpu::Buffer,
     capsule_cap: usize,
     capsule_count: u32,
+
+    offscreen: Option<OffscreenTarget>,
 }
+
+const MESH_WGSL: &str = r#"
+struct Uniforms {
+    view_proj: mat4x4<f32>,
+    cam_right: vec4<f32>,
+    cam_up: vec4<f32>,
+    cam_fwd: vec4<f32>,
+    cam_eye: vec4<f32>,
+    clip_params: vec4<f32>,
+    light_params: vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> u: Uniforms;
+
+struct VsOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) world_normal: vec3<f32>,
+    @location(1) color: vec4<f32>,
+    @location(2) view_z: f32,
+};
+
+@vertex
+fn vs_main(
+    @location(0) pos: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) color: vec4<f32>,
+) -> VsOut {
+    var out: VsOut;
+    out.clip_pos = u.view_proj * vec4<f32>(pos, 1.0);
+    out.world_normal = normal;
+    out.color = color;
+    out.view_z = dot(pos - u.cam_eye.xyz, u.cam_fwd.xyz);
+    return out;
+}
+
+@fragment
+fn fs_main(in: VsOut, @builtin(front_facing) is_front: bool) -> @location(0) vec4<f32> {
+    if (in.view_z < u.clip_params.x || in.view_z > u.clip_params.y) {
+        discard;
+    }
+    var wn = normalize(in.world_normal);
+    if (!is_front) {
+        wn = -wn;
+    }
+    // Transform normal into camera space for consistent ChimeraX / PyMOL studio lighting
+    let n = normalize(vec3<f32>(
+        dot(wn, u.cam_right.xyz),
+        dot(wn, u.cam_up.xyz),
+        max(-dot(wn, u.cam_fwd.xyz), 0.02)
+    ));
+    let l1 = normalize(vec3<f32>(0.36, 0.56, 0.74));
+    let l2 = normalize(vec3<f32>(-0.58, -0.22, 0.78));
+    let d1 = max(dot(n, l1), 0.0);
+    let d2 = max(dot(n, l2), 0.0);
+    let h1 = normalize(l1 + vec3<f32>(0.0, 0.0, 1.0));
+    let preset = u.light_params.x;
+
+    var amb = 0.28;
+    var diff_k = 0.64;
+    var fill_k = 0.22;
+    var spec_k = 0.24;
+    var shininess = 28.0;
+    if (preset > 0.5 && preset < 1.5) {
+        // Flat diagram preset
+        amb = 0.70; diff_k = 0.28; fill_k = 0.08; spec_k = 0.02;
+    } else if (preset >= 1.5 && preset < 2.5) {
+        // Full glossy specular
+        amb = 0.22; diff_k = 0.72; fill_k = 0.20; spec_k = 0.48; shininess = 46.0;
+    } else if (preset >= 2.5 && preset < 3.5) {
+        // Dark Studio Rim
+        amb = 0.18; diff_k = 0.70; fill_k = 0.26; spec_k = 0.34; shininess = 36.0;
+    } else if (preset >= 3.5) {
+        // PyMOL Publication White
+        amb = 0.34; diff_k = 0.62; fill_k = 0.22; spec_k = 0.18; shininess = 24.0;
+    }
+
+    let spec = pow(max(dot(n, h1), 0.0), shininess) * spec_k;
+    let rim = pow(clamp(1.0 - n.z, 0.0, 1.0), 3.0) * select(0.08, 0.22, preset >= 2.5 && preset < 3.5);
+    let z_ref = max(u.clip_params.z, 10.0);
+    let fog = clamp(1.0 - clamp((in.view_z - z_ref * 0.80) / (z_ref * 2.5), 0.0, 0.36), 0.64, 1.0);
+    let lit = (amb + diff_k * d1 + fill_k * d2) * fog;
+    let rgb = clamp(in.color.rgb * lit + vec3<f32>(spec + rim), vec3<f32>(0.0), vec3<f32>(1.0));
+    return vec4<f32>(rgb, in.color.a);
+}
+"#;
 
 const SPHERE_WGSL: &str = r#"
 struct Uniforms {
     view_proj: mat4x4<f32>,
     cam_right: vec4<f32>,
     cam_up: vec4<f32>,
+    cam_fwd: vec4<f32>,
     cam_eye: vec4<f32>,
-    fog_params: vec4<f32>,
+    clip_params: vec4<f32>,
+    light_params: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
@@ -50,7 +189,13 @@ struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) local_uv: vec2<f32>,
     @location(1) color: vec4<f32>,
-    @location(2) dist_cam: f32,
+    @location(2) center_world: vec3<f32>,
+    @location(3) radius: f32,
+};
+
+struct FsOut {
+    @location(0) color: vec4<f32>,
+    @builtin(frag_depth) depth: f32,
 };
 
 @vertex
@@ -74,28 +219,42 @@ fn vs_main(
     out.clip_pos = u.view_proj * vec4<f32>(world, 1.0);
     out.local_uv = uv;
     out.color = color;
-    out.dist_cam = length(center - u.cam_eye.xyz);
+    out.center_world = center;
+    out.radius = radius;
     return out;
 }
 
 @fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+fn fs_main(in: VsOut) -> FsOut {
     let r2 = dot(in.local_uv, in.local_uv);
     if (r2 > 1.0) { discard; }
     let nz = sqrt(max(0.0, 1.0 - r2));
     let n = vec3<f32>(in.local_uv.x, in.local_uv.y, nz);
-    let l1 = normalize(vec3<f32>(0.38, 0.58, 0.72));
-    let l2 = normalize(vec3<f32>(-0.55, -0.25, 0.80));
+    let hit_world = in.center_world
+        + u.cam_right.xyz * (in.local_uv.x * in.radius)
+        + u.cam_up.xyz * (in.local_uv.y * in.radius)
+        - u.cam_fwd.xyz * (nz * in.radius);
+    let view_z = dot(hit_world - u.cam_eye.xyz, u.cam_fwd.xyz);
+    if (view_z < u.clip_params.x || view_z > u.clip_params.y) {
+        discard;
+    }
+    let proj = u.view_proj * vec4<f32>(hit_world, 1.0);
+    let frag_z = clamp(proj.z / max(proj.w, 1e-5), 0.0, 1.0);
+
+    let l1 = normalize(vec3<f32>(0.36, 0.56, 0.74));
+    let l2 = normalize(vec3<f32>(-0.58, -0.22, 0.78));
     let d1 = max(dot(n, l1), 0.0);
     let d2 = max(dot(n, l2), 0.0);
     let h1 = normalize(l1 + vec3<f32>(0.0, 0.0, 1.0));
-    let spec = pow(max(dot(n, h1), 0.0), 28.0) * 0.30;
-    let sil = select(1.0, select(1.0, 0.44 + 2.3 * nz, nz < 0.24), u.fog_params.y > 0.5);
-    let z_ref = max(u.fog_params.x, 10.0);
-    let fog = clamp(1.0 - clamp((in.dist_cam - z_ref * 0.75) / (z_ref * 2.2), 0.0, 0.42), 0.58, 1.0);
-    let lit = (0.24 + 0.68 * d1 + 0.20 * d2) * sil * fog;
-    let rgb = clamp(in.color.rgb * lit + vec3<f32>(spec * sil), vec3<f32>(0.0), vec3<f32>(1.0));
-    return vec4<f32>(rgb, in.color.a);
+    let spec = pow(max(dot(n, h1), 0.0), 30.0) * 0.30;
+    let z_ref = max(u.clip_params.z, 10.0);
+    let fog = clamp(1.0 - clamp((view_z - z_ref * 0.80) / (z_ref * 2.5), 0.0, 0.36), 0.64, 1.0);
+    let lit = (0.26 + 0.66 * d1 + 0.20 * d2) * fog;
+    let rgb = clamp(in.color.rgb * lit + vec3<f32>(spec), vec3<f32>(0.0), vec3<f32>(1.0));
+    var out: FsOut;
+    out.color = vec4<f32>(rgb, in.color.a);
+    out.depth = frag_z;
+    return out;
 }
 "#;
 
@@ -104,8 +263,10 @@ struct Uniforms {
     view_proj: mat4x4<f32>,
     cam_right: vec4<f32>,
     cam_up: vec4<f32>,
+    cam_fwd: vec4<f32>,
     cam_eye: vec4<f32>,
-    fog_params: vec4<f32>,
+    clip_params: vec4<f32>,
+    light_params: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
@@ -114,7 +275,13 @@ struct VsOut {
     @location(0) local_uv: vec2<f32>,
     @location(1) color: vec4<f32>,
     @location(2) dashed: f32,
-    @location(3) dist_cam: f32,
+    @location(3) world_pos: vec3<f32>,
+    @location(4) radius: f32,
+};
+
+struct FsOut {
+    @location(0) color: vec4<f32>,
+    @builtin(frag_depth) depth: f32,
 };
 
 @vertex
@@ -145,7 +312,7 @@ fn vs_main(
     } else {
         side = u.cam_right.xyz;
     }
-    let ext = select(vec3<f32>(0.0), normalize(axis) * (radius * 0.35), length(axis) > 1e-4);
+    let ext = select(vec3<f32>(0.0), normalize(axis) * (radius * 0.30), length(axis) > 1e-4);
     let base_pt = mix(pa - ext, pb + ext, q.x);
     let world = base_pt + side * (q.y * radius);
     var out: VsOut;
@@ -153,27 +320,122 @@ fn vs_main(
     out.local_uv = q;
     out.color = color;
     out.dashed = dashed;
-    out.dist_cam = length(mid - u.cam_eye.xyz);
+    out.world_pos = world;
+    out.radius = radius;
     return out;
 }
 
 @fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+fn fs_main(in: VsOut) -> FsOut {
     if (in.dashed > 0.5 && (i32(floor(in.local_uv.x * 9.0)) % 2) == 1) {
         discard;
     }
     let y = in.local_uv.y;
     let nz = sqrt(max(0.0, 1.0 - y * y));
+    let hit_world = in.world_pos - u.cam_fwd.xyz * (nz * in.radius);
+    let view_z = dot(hit_world - u.cam_eye.xyz, u.cam_fwd.xyz);
+    if (view_z < u.clip_params.x || view_z > u.clip_params.y) {
+        discard;
+    }
+    let proj = u.view_proj * vec4<f32>(hit_world, 1.0);
+    let frag_z = clamp(proj.z / max(proj.w, 1e-5), 0.0, 1.0);
+
     let n = vec3<f32>(0.0, y, nz);
-    let l1 = normalize(vec3<f32>(0.38, 0.58, 0.72));
-    let l2 = normalize(vec3<f32>(-0.55, -0.25, 0.80));
+    let l1 = normalize(vec3<f32>(0.36, 0.56, 0.74));
+    let l2 = normalize(vec3<f32>(-0.58, -0.22, 0.78));
     let d1 = max(dot(n, l1), 0.0);
     let d2 = max(dot(n, l2), 0.0);
-    let sil = select(1.0, select(1.0, 0.45 + 2.2 * nz, nz < 0.24), u.fog_params.y > 0.5);
-    let z_ref = max(u.fog_params.x, 10.0);
-    let fog = clamp(1.0 - clamp((in.dist_cam - z_ref * 0.75) / (z_ref * 2.2), 0.0, 0.42), 0.58, 1.0);
-    let lit = (0.26 + 0.64 * d1 + 0.20 * d2) * sil * fog;
-    return vec4<f32>(clamp(in.color.rgb * lit, vec3<f32>(0.0), vec3<f32>(1.0)), in.color.a);
+    let z_ref = max(u.clip_params.z, 10.0);
+    let fog = clamp(1.0 - clamp((view_z - z_ref * 0.80) / (z_ref * 2.5), 0.0, 0.36), 0.64, 1.0);
+    let lit = (0.28 + 0.62 * d1 + 0.20 * d2) * fog;
+    var out: FsOut;
+    out.color = vec4<f32>(clamp(in.color.rgb * lit, vec3<f32>(0.0), vec3<f32>(1.0)), in.color.a);
+    out.depth = frag_z;
+    return out;
+}
+"#;
+
+/// Full-screen post-process shader: 12-tap Poisson-disk Screen-Space Ambient Occlusion (SSAO)
+/// + ChimeraX-style Depth-Discontinuity Silhouette Outlines directly over the offscreen Depth32Float buffer.
+const POST_SSAO_WGSL: &str = r#"
+struct Uniforms {
+    view_proj: mat4x4<f32>,
+    cam_right: vec4<f32>,
+    cam_up: vec4<f32>,
+    cam_fwd: vec4<f32>,
+    cam_eye: vec4<f32>,
+    clip_params: vec4<f32>,
+    light_params: vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(1) @binding(0) var color_tex: texture_2d<f32>;
+@group(1) @binding(1) var depth_tex: texture_depth_2d;
+
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
+    var pts = array<vec2<f32>, 6>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 1.0, -1.0),
+        vec2<f32>( 1.0,  1.0),
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 1.0,  1.0),
+        vec2<f32>(-1.0,  1.0),
+    );
+    let p = pts[vid];
+    var out: VsOut;
+    out.pos = vec4<f32>(p, 0.0, 1.0);
+    out.uv = vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
+    return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let dims = vec2<i32>(textureDimensions(color_tex));
+    let xy = clamp(vec2<i32>(in.uv * vec2<f32>(dims)), vec2<i32>(0, 0), dims - vec2<i32>(1, 1));
+    let base = textureLoad(color_tex, xy, 0);
+    let d0 = textureLoad(depth_tex, xy, 0);
+    if (d0 >= 0.99995) {
+        return base;
+    }
+
+    var factor = 1.0;
+    let ssao_str = clamp(u.clip_params.w, 0.0, 1.0);
+    if (ssao_str > 0.01) {
+        var offsets = array<vec2<i32>, 12>(
+            vec2<i32>( 3,  0), vec2<i32>(-3,  0), vec2<i32>( 0,  3), vec2<i32>( 0, -3),
+            vec2<i32>( 5,  4), vec2<i32>(-5,  4), vec2<i32>( 5, -4), vec2<i32>(-5, -4),
+            vec2<i32>( 9,  2), vec2<i32>(-9, -2), vec2<i32>( 2,  9), vec2<i32>(-2, -9),
+        );
+        var occ = 0.0;
+        for (var i = 0; i < 12; i = i + 1) {
+            let sc = clamp(xy + offsets[i], vec2<i32>(0, 0), dims - vec2<i32>(1, 1));
+            let ds = textureLoad(depth_tex, sc, 0);
+            let diff = d0 - ds;
+            if (diff > 0.0004 && diff < 0.045) {
+                occ = occ + 1.0;
+            }
+        }
+        factor = factor * (1.0 - (occ / 12.0) * 0.42 * ssao_str);
+    }
+
+    // Crisp ChimeraX-style depth silhouette edges
+    if (u.light_params.y > 0.5) {
+        let dl = textureLoad(depth_tex, clamp(xy + vec2<i32>(-1, 0), vec2<i32>(0, 0), dims - vec2<i32>(1, 1)), 0);
+        let dr = textureLoad(depth_tex, clamp(xy + vec2<i32>( 1, 0), vec2<i32>(0, 0), dims - vec2<i32>(1, 1)), 0);
+        let du = textureLoad(depth_tex, clamp(xy + vec2<i32>( 0,-1), vec2<i32>(0, 0), dims - vec2<i32>(1, 1)), 0);
+        let dd = textureLoad(depth_tex, clamp(xy + vec2<i32>( 0, 1), vec2<i32>(0, 0), dims - vec2<i32>(1, 1)), 0);
+        let max_jump = max(max(dl - d0, dr - d0), max(du - d0, dd - d0));
+        if (max_jump > 0.0065) {
+            factor = factor * 0.42;
+        }
+    }
+
+    return vec4<f32>(clamp(base.rgb * factor, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
 "#;
 
@@ -194,8 +456,104 @@ impl SharedViewportScene {
 struct BiomolPaintCallback {
     camera: Camera3D,
     aspect: f32,
+    px_size: [u32; 2],
     show_silhouettes: bool,
     scene: SharedViewportScene,
+}
+
+fn ensure_offscreen(
+    device: &wgpu::Device,
+    post_bgl: &wgpu::BindGroupLayout,
+    slot: &mut Option<OffscreenTarget>,
+    w: u32,
+    h: u32,
+) {
+    let w = w.clamp(64, 4096);
+    let h = h.clamp(64, 4096);
+    if let Some(cur) = slot.as_ref()
+        && cur.width == w
+        && cur.height == h
+    {
+        return;
+    }
+    let color_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("biomol_offscreen_color"),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Bgra8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let color_view = color_tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("biomol_offscreen_depth"),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let post_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("biomol_post_bg"),
+        layout: post_bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&color_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&depth_view),
+            },
+        ],
+    });
+    *slot = Some(OffscreenTarget {
+        width: w,
+        height: h,
+        color_tex,
+        color_view,
+        depth_tex,
+        depth_view,
+        post_bg,
+    });
+}
+
+fn upload_buffer<T: Pod>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    buf: &mut wgpu::Buffer,
+    cap: &mut usize,
+    usage: wgpu::BufferUsages,
+    label: &str,
+    items: &[T],
+) -> u32 {
+    if items.len() > *cap {
+        let new_cap = items.len().next_power_of_two().max(1024);
+        *buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: (new_cap * std::mem::size_of::<T>()) as u64,
+            usage: usage | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        *cap = new_cap;
+    }
+    if !items.is_empty() {
+        queue.write_buffer(buf, 0, bytemuck::cast_slice(items));
+    }
+    items.len() as u32
 }
 
 impl CallbackTrait for BiomolPaintCallback {
@@ -216,54 +574,259 @@ impl CallbackTrait for BiomolPaintCallback {
             return Vec::new();
         };
 
-        let (right, up, _) = self.camera.basis();
+        ensure_offscreen(
+            device,
+            &gpu.post_bgl,
+            &mut gpu.offscreen,
+            self.px_size[0],
+            self.px_size[1],
+        );
+
+        let (right, up, fwd) = self.camera.basis();
         let eye = self.camera.eye();
+        let (clip_near, clip_far) = self.camera.clip_planes();
+        let mut clear_bg = [0.06_f64, 0.08, 0.12, 1.0];
+        let mut light_id = 0.0_f32;
+        let mut ssao_str = 0.55_f32;
+        let mut sil_on = self.show_silhouettes;
+
+        if let Ok(sc) = self.scene.data.read() {
+            clear_bg = [
+                f64::from(sc.background[0]),
+                f64::from(sc.background[1]),
+                f64::from(sc.background[2]),
+                1.0,
+            ];
+            light_id = sc.lighting.shader_id();
+            ssao_str = sc.ssao_strength;
+            sil_on = self.show_silhouettes && sc.show_silhouettes;
+
+            // Flatten opaque meshes
+            let mut op_verts: Vec<MeshVertex> = Vec::new();
+            let mut op_idxs: Vec<u32> = Vec::new();
+            for m in &sc.opaque_meshes {
+                let base = op_verts.len() as u32;
+                op_verts.extend_from_slice(&m.vertices);
+                op_idxs.extend(m.indices.iter().map(|&i| base + i));
+            }
+            let _ = upload_buffer(
+                device,
+                queue,
+                &mut gpu.opaque_vbuf,
+                &mut gpu.opaque_vcap,
+                wgpu::BufferUsages::VERTEX,
+                "biomol_opaque_vbuf",
+                &op_verts,
+            );
+            gpu.opaque_icount = upload_buffer(
+                device,
+                queue,
+                &mut gpu.opaque_ibuf,
+                &mut gpu.opaque_icap,
+                wgpu::BufferUsages::INDEX,
+                "biomol_opaque_ibuf",
+                &op_idxs,
+            );
+
+            // Flatten transparent & wireframe meshes
+            let mut tr_verts: Vec<MeshVertex> = Vec::new();
+            let mut tr_idxs: Vec<u32> = Vec::new();
+            let mut wr_verts: Vec<MeshVertex> = Vec::new();
+            let mut wr_idxs: Vec<u32> = Vec::new();
+            for m in &sc.transparent_meshes {
+                if m.wireframe {
+                    let base = wr_verts.len() as u32;
+                    wr_verts.extend_from_slice(&m.vertices);
+                    for tri in m.indices.as_chunks::<3>().0 {
+                        wr_idxs.extend_from_slice(&[
+                            base + tri[0],
+                            base + tri[1],
+                            base + tri[1],
+                            base + tri[2],
+                            base + tri[2],
+                            base + tri[0],
+                        ]);
+                    }
+                } else {
+                    let base = tr_verts.len() as u32;
+                    tr_verts.extend_from_slice(&m.vertices);
+                    tr_idxs.extend(m.indices.iter().map(|&i| base + i));
+                }
+            }
+            let _ = upload_buffer(
+                device,
+                queue,
+                &mut gpu.transp_vbuf,
+                &mut gpu.transp_vcap,
+                wgpu::BufferUsages::VERTEX,
+                "biomol_transp_vbuf",
+                &tr_verts,
+            );
+            gpu.transp_icount = upload_buffer(
+                device,
+                queue,
+                &mut gpu.transp_ibuf,
+                &mut gpu.transp_icap,
+                wgpu::BufferUsages::INDEX,
+                "biomol_transp_ibuf",
+                &tr_idxs,
+            );
+            let _ = upload_buffer(
+                device,
+                queue,
+                &mut gpu.wire_vbuf,
+                &mut gpu.wire_vcap,
+                wgpu::BufferUsages::VERTEX,
+                "biomol_wire_vbuf",
+                &wr_verts,
+            );
+            gpu.wire_icount = upload_buffer(
+                device,
+                queue,
+                &mut gpu.wire_ibuf,
+                &mut gpu.wire_icap,
+                wgpu::BufferUsages::INDEX,
+                "biomol_wire_ibuf",
+                &wr_idxs,
+            );
+
+            // Partition opaque vs translucent spheres (HYDE coronas, pharmacophores, ΔMIF)
+            let mut sp_op = Vec::new();
+            let mut sp_tr = Vec::new();
+            for &sp in &sc.spheres {
+                if sp.color[3] >= 0.95 {
+                    sp_op.push(sp);
+                } else {
+                    sp_tr.push(sp);
+                }
+            }
+            gpu.sphere_opaque_count = upload_buffer(
+                device,
+                queue,
+                &mut gpu.sphere_opaque_buf,
+                &mut gpu.sphere_opaque_cap,
+                wgpu::BufferUsages::VERTEX,
+                "biomol_spheres_op",
+                &sp_op,
+            );
+            gpu.sphere_transp_count = upload_buffer(
+                device,
+                queue,
+                &mut gpu.sphere_transp_buf,
+                &mut gpu.sphere_transp_cap,
+                wgpu::BufferUsages::VERTEX,
+                "biomol_spheres_tr",
+                &sp_tr,
+            );
+            gpu.capsule_count = upload_buffer(
+                device,
+                queue,
+                &mut gpu.capsule_buf,
+                &mut gpu.capsule_cap,
+                wgpu::BufferUsages::VERTEX,
+                "biomol_capsules",
+                &sc.capsules,
+            );
+        }
+
         let uniforms = Uniforms {
             view_proj: self.camera.view_proj_matrix(self.aspect),
             cam_right: [right[0], right[1], right[2], 0.0],
             cam_up: [up[0], up[1], up[2], 0.0],
+            cam_fwd: [fwd[0], fwd[1], fwd[2], 0.0],
             cam_eye: [eye[0], eye[1], eye[2], 1.0],
-            fog_params: [
-                self.camera.distance,
-                if self.show_silhouettes { 1.0 } else { 0.0 },
-                0.0,
-                0.0,
+            clip_params: [clip_near, clip_far, self.camera.distance, ssao_str],
+            light_params: [
+                light_id,
+                if sil_on { 1.0 } else { 0.0 },
+                self.px_size[0] as f32,
+                self.px_size[1] as f32,
             ],
         };
         queue.write_buffer(&gpu.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 
-        if let Ok(sc) = self.scene.data.read() {
-            if sc.spheres.len() > gpu.sphere_cap {
-                let new_cap = sc.spheres.len().next_power_of_two().max(1024);
-                gpu.sphere_buf = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("biomol_spheres"),
-                    size: (new_cap * std::mem::size_of::<SphereInstance>()) as u64,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                gpu.sphere_cap = new_cap;
-            }
-            if !sc.spheres.is_empty() {
-                queue.write_buffer(&gpu.sphere_buf, 0, bytemuck::cast_slice(&sc.spheres));
-            }
-            gpu.sphere_count = sc.spheres.len() as u32;
+        let Some(ref target) = gpu.offscreen else {
+            return Vec::new();
+        };
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("biomol_offscreen_encoder"),
+        });
+        {
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("biomol_offscreen_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target.color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: clear_bg[0],
+                            g: clear_bg[1],
+                            b: clear_bg[2],
+                            a: clear_bg[3],
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &target.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
 
-            if sc.capsules.len() > gpu.capsule_cap {
-                let new_cap = sc.capsules.len().next_power_of_two().max(2048);
-                gpu.capsule_buf = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("biomol_capsules"),
-                    size: (new_cap * std::mem::size_of::<CapsuleInstance>()) as u64,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                gpu.capsule_cap = new_cap;
+            // 1. Opaque meshes (Cartoon ribbons, β-arrows, RNA slabs, opaque SES)
+            if gpu.opaque_icount > 0 {
+                rp.set_pipeline(&gpu.mesh_opaque_pipeline);
+                rp.set_bind_group(0, &gpu.uniform_bg, &[]);
+                rp.set_vertex_buffer(0, gpu.opaque_vbuf.slice(..));
+                rp.set_index_buffer(gpu.opaque_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..gpu.opaque_icount, 0, 0..1);
             }
-            if !sc.capsules.is_empty() {
-                queue.write_buffer(&gpu.capsule_buf, 0, bytemuck::cast_slice(&sc.capsules));
+            // 2. Opaque capsules (bonds, stems, H-bonds, GridBox wireframe)
+            if gpu.capsule_count > 0 {
+                rp.set_pipeline(&gpu.capsule_pipeline);
+                rp.set_bind_group(0, &gpu.uniform_bg, &[]);
+                rp.set_vertex_buffer(0, gpu.capsule_buf.slice(..));
+                rp.draw(0..6, 0..gpu.capsule_count);
             }
-            gpu.capsule_count = sc.capsules.len() as u32;
+            // 3. Opaque spheres (atoms, VDW, ions)
+            if gpu.sphere_opaque_count > 0 {
+                rp.set_pipeline(&gpu.sphere_opaque_pipeline);
+                rp.set_bind_group(0, &gpu.uniform_bg, &[]);
+                rp.set_vertex_buffer(0, gpu.sphere_opaque_buf.slice(..));
+                rp.draw(0..6, 0..gpu.sphere_opaque_count);
+            }
+            // 4. Translucent meshes (SES shell, Cryo-EM solid isosurface)
+            if gpu.transp_icount > 0 {
+                rp.set_pipeline(&gpu.mesh_transp_pipeline);
+                rp.set_bind_group(0, &gpu.uniform_bg, &[]);
+                rp.set_vertex_buffer(0, gpu.transp_vbuf.slice(..));
+                rp.set_index_buffer(gpu.transp_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..gpu.transp_icount, 0, 0..1);
+            }
+            // 5. Wireframe meshes (`isomesh` surface / Cryo-EM)
+            if gpu.wire_icount > 0 {
+                rp.set_pipeline(&gpu.mesh_wire_pipeline);
+                rp.set_bind_group(0, &gpu.uniform_bg, &[]);
+                rp.set_vertex_buffer(0, gpu.wire_vbuf.slice(..));
+                rp.set_index_buffer(gpu.wire_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..gpu.wire_icount, 0, 0..1);
+            }
+            // 6. Translucent overlay spheres (HYDE coronas, pharmacophores, ΔMIF)
+            if gpu.sphere_transp_count > 0 {
+                rp.set_pipeline(&gpu.sphere_transp_pipeline);
+                rp.set_bind_group(0, &gpu.uniform_bg, &[]);
+                rp.set_vertex_buffer(0, gpu.sphere_transp_buf.slice(..));
+                rp.draw(0..6, 0..gpu.sphere_transp_count);
+            }
         }
-        Vec::new()
+        let _ = (&target.color_tex, &target.depth_tex);
+        vec![encoder.finish()]
     }
 
     fn paint(
@@ -275,19 +838,24 @@ impl CallbackTrait for BiomolPaintCallback {
         let Some(gpu) = resources.get::<GpuBiomolResources>() else {
             return;
         };
-        if gpu.capsule_count > 0 {
-            render_pass.set_pipeline(&gpu.capsule_pipeline);
-            render_pass.set_bind_group(0, &gpu.uniform_bg, &[]);
-            render_pass.set_vertex_buffer(0, gpu.capsule_buf.slice(..));
-            render_pass.draw(0..6, 0..gpu.capsule_count);
-        }
-        if gpu.sphere_count > 0 {
-            render_pass.set_pipeline(&gpu.sphere_pipeline);
-            render_pass.set_bind_group(0, &gpu.uniform_bg, &[]);
-            render_pass.set_vertex_buffer(0, gpu.sphere_buf.slice(..));
-            render_pass.draw(0..6, 0..gpu.sphere_count);
-        }
+        let Some(ref target) = gpu.offscreen else {
+            return;
+        };
+        render_pass.set_pipeline(&gpu.post_pipeline);
+        render_pass.set_bind_group(0, &gpu.uniform_bg, &[]);
+        render_pass.set_bind_group(1, &target.post_bg, &[]);
+        render_pass.draw(0..6, 0..1);
     }
+}
+
+fn depth_state(write_enabled: bool) -> Option<wgpu::DepthStencilState> {
+    Some(wgpu::DepthStencilState {
+        format: wgpu::TextureFormat::Depth32Float,
+        depth_write_enabled: write_enabled,
+        depth_compare: wgpu::CompareFunction::LessEqual,
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState::default(),
+    })
 }
 
 fn create_gpu_resources(
@@ -326,6 +894,119 @@ fn create_gpu_resources(
         push_constant_ranges: &[],
     });
 
+    // Post-process bind group layout (color_tex + depth_tex via textureLoad)
+    let post_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("biomol_post_bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+        ],
+    });
+    let post_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("biomol_post_pl_layout"),
+        bind_group_layouts: &[&bgl, &post_bgl],
+        push_constant_ranges: &[],
+    });
+
+    // 1. Indexed Triangle Mesh Pipelines (Opaque, Transparent, Wireframe LineList)
+    let mesh_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("biomol_mesh_wgsl"),
+        source: wgpu::ShaderSource::Wgsl(MESH_WGSL.into()),
+    });
+    let mesh_attrs = [
+        wgpu::VertexAttribute {
+            offset: 0,
+            shader_location: 0,
+            format: wgpu::VertexFormat::Float32x3,
+        },
+        wgpu::VertexAttribute {
+            offset: 12,
+            shader_location: 1,
+            format: wgpu::VertexFormat::Float32x3,
+        },
+        wgpu::VertexAttribute {
+            offset: 24,
+            shader_location: 2,
+            format: wgpu::VertexFormat::Float32x4,
+        },
+    ];
+    let make_mesh_pipeline = |label: &str,
+                              topology: wgpu::PrimitiveTopology,
+                              blend: Option<wgpu::BlendState>,
+                              depth_write: bool| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(&pl_layout),
+            vertex: wgpu::VertexState {
+                module: &mesh_mod,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<MeshVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &mesh_attrs,
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &mesh_mod,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: depth_state(depth_write),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        })
+    };
+
+    let mesh_opaque_pipeline = make_mesh_pipeline(
+        "biomol_mesh_opaque",
+        wgpu::PrimitiveTopology::TriangleList,
+        None,
+        true,
+    );
+    let mesh_transp_pipeline = make_mesh_pipeline(
+        "biomol_mesh_transp",
+        wgpu::PrimitiveTopology::TriangleList,
+        Some(wgpu::BlendState::ALPHA_BLENDING),
+        false,
+    );
+    let mesh_wire_pipeline = make_mesh_pipeline(
+        "biomol_mesh_wire",
+        wgpu::PrimitiveTopology::LineList,
+        Some(wgpu::BlendState::ALPHA_BLENDING),
+        false,
+    );
+
+    // 2. Sphere Impostor Pipelines (Opaque + Transparent)
     let sphere_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("biomol_sphere_wgsl"),
         source: wgpu::ShaderSource::Wgsl(SPHERE_WGSL.into()),
@@ -347,36 +1028,45 @@ fn create_gpu_resources(
             format: wgpu::VertexFormat::Float32x4,
         },
     ];
-    let sphere_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("biomol_sphere_pipeline"),
-        layout: Some(&pl_layout),
-        vertex: wgpu::VertexState {
-            module: &sphere_mod,
-            entry_point: Some("vs_main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<SphereInstance>() as u64,
-                step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &sphere_attrs,
-            }],
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &sphere_mod,
-            entry_point: Some("fs_main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: target_format,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview: None,
-        cache: None,
-    });
+    let make_sphere_pipeline = |label: &str, blend: Option<wgpu::BlendState>, depth_write: bool| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(&pl_layout),
+            vertex: wgpu::VertexState {
+                module: &sphere_mod,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<SphereInstance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &sphere_attrs,
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &sphere_mod,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: depth_state(depth_write),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        })
+    };
+    let sphere_opaque_pipeline = make_sphere_pipeline("biomol_sphere_opaque", None, true);
+    let sphere_transp_pipeline = make_sphere_pipeline(
+        "biomol_sphere_transp",
+        Some(wgpu::BlendState::ALPHA_BLENDING),
+        false,
+    );
 
+    // 3. Capsule Pipeline
     let cap_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("biomol_capsule_wgsl"),
         source: wgpu::ShaderSource::Wgsl(CAPSULE_WGSL.into()),
@@ -432,43 +1122,130 @@ fn create_gpu_resources(
             })],
         }),
         primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: depth_state(true),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: None,
+    });
+
+    // 4. Post-process SSAO + Depth Silhouettes Blit Pipeline (no depth buffer, draws into egui pass)
+    let post_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("biomol_post_ssao_wgsl"),
+        source: wgpu::ShaderSource::Wgsl(POST_SSAO_WGSL.into()),
+    });
+    let post_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("biomol_post_ssao_pipeline"),
+        layout: Some(&post_pl_layout),
+        vertex: wgpu::VertexState {
+            module: &post_mod,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &post_mod,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: target_format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
         multiview: None,
         cache: None,
     });
 
-    let sphere_cap = 1024;
-    let capsule_cap = 2048;
-    let sphere_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("biomol_spheres"),
-        size: (sphere_cap * std::mem::size_of::<SphereInstance>()) as u64,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let capsule_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("biomol_capsules"),
-        size: (capsule_cap * std::mem::size_of::<CapsuleInstance>()) as u64,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let mk_buf = |label: &str, bytes: u64, usage: wgpu::BufferUsages| {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: bytes.max(64),
+            usage: usage | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    };
 
+    let init_cap = 1024usize;
     GpuBiomolResources {
-        sphere_pipeline,
+        mesh_opaque_pipeline,
+        mesh_transp_pipeline,
+        mesh_wire_pipeline,
+        sphere_opaque_pipeline,
+        sphere_transp_pipeline,
         capsule_pipeline,
+        post_pipeline,
+        post_bgl,
         uniform_buf,
         uniform_bg,
-        sphere_buf,
-        sphere_cap,
-        sphere_count: 0,
-        capsule_buf,
-        capsule_cap,
+        opaque_vbuf: mk_buf(
+            "biomol_opaque_vbuf",
+            (init_cap * std::mem::size_of::<MeshVertex>()) as u64,
+            wgpu::BufferUsages::VERTEX,
+        ),
+        opaque_vcap: init_cap,
+        opaque_ibuf: mk_buf(
+            "biomol_opaque_ibuf",
+            (init_cap * 4) as u64,
+            wgpu::BufferUsages::INDEX,
+        ),
+        opaque_icap: init_cap,
+        opaque_icount: 0,
+        transp_vbuf: mk_buf(
+            "biomol_transp_vbuf",
+            (init_cap * std::mem::size_of::<MeshVertex>()) as u64,
+            wgpu::BufferUsages::VERTEX,
+        ),
+        transp_vcap: init_cap,
+        transp_ibuf: mk_buf(
+            "biomol_transp_ibuf",
+            (init_cap * 4) as u64,
+            wgpu::BufferUsages::INDEX,
+        ),
+        transp_icap: init_cap,
+        transp_icount: 0,
+        wire_vbuf: mk_buf(
+            "biomol_wire_vbuf",
+            (init_cap * std::mem::size_of::<MeshVertex>()) as u64,
+            wgpu::BufferUsages::VERTEX,
+        ),
+        wire_vcap: init_cap,
+        wire_ibuf: mk_buf(
+            "biomol_wire_ibuf",
+            (init_cap * 4) as u64,
+            wgpu::BufferUsages::INDEX,
+        ),
+        wire_icap: init_cap,
+        wire_icount: 0,
+        sphere_opaque_buf: mk_buf(
+            "biomol_spheres_op",
+            (init_cap * std::mem::size_of::<SphereInstance>()) as u64,
+            wgpu::BufferUsages::VERTEX,
+        ),
+        sphere_opaque_cap: init_cap,
+        sphere_opaque_count: 0,
+        sphere_transp_buf: mk_buf(
+            "biomol_spheres_tr",
+            (init_cap * std::mem::size_of::<SphereInstance>()) as u64,
+            wgpu::BufferUsages::VERTEX,
+        ),
+        sphere_transp_cap: init_cap,
+        sphere_transp_count: 0,
+        capsule_buf: mk_buf(
+            "biomol_capsules",
+            (init_cap * std::mem::size_of::<CapsuleInstance>()) as u64,
+            wgpu::BufferUsages::VERTEX,
+        ),
+        capsule_cap: init_cap,
         capsule_count: 0,
+        offscreen: None,
     }
 }
 
-/// Interactive embeddable `egui` 3D biomolecular viewport widget (backed by `wgpu 24`, with
-/// automatic software-canvas fallback when running under Glow/CPU).
+/// Interactive embeddable `egui` 3D biomolecular viewport widget (backed by `wgpu 24` offscreen
+/// `Depth32Float` + GPU SSAO/Silhouettes, with automatic software fallback on non-wgpu backends).
 pub fn show_biomol_viewport(
     ui: &mut egui::Ui,
     camera: &mut Camera3D,
@@ -516,19 +1293,24 @@ pub fn show_biomol_viewport(
     );
 
     let aspect = (rect.width() / rect.height().max(1.0)).max(0.1);
+    let ppp = ui.ctx().pixels_per_point();
+    let px_w = ((rect.width() * ppp).round() as u32).clamp(64, 4096);
+    let px_h = ((rect.height() * ppp).round() as u32).clamp(64, 4096);
+
     if use_wgpu {
         let cb = Callback::new_paint_callback(
             rect,
             BiomolPaintCallback {
                 camera: camera.clone(),
                 aspect,
+                px_size: [px_w, px_h],
                 show_silhouettes,
                 scene: scene.clone(),
             },
         );
         painter.add(cb);
     } else if let Ok(sc) = scene.data.read() {
-        // Depth-sorted pure-egui 3D fallback when app uses non-wgpu backend
+        // Software fallback when running without wgpu backend
         let eye = camera.eye();
         let (right, up, fwd) = camera.basis();
         let half_h = (0.5 * camera.fov_y_rad).tan();

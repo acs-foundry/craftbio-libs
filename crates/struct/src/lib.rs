@@ -16,11 +16,11 @@ pub use align::{
 };
 pub use analysis::{
     DipoleMomentReport, assign_secondary_structure, compute_dipole_moment, compute_esp_at_points,
-    compute_per_atom_sap, compute_sasa,
+    compute_mlp_at_points, compute_per_atom_mlp, compute_per_atom_sap, compute_sasa,
 };
 pub use io::{
-    finalize_biomolecule, load_dcd_frames, parse_fasta, parse_mmcif, parse_pdb,
-    parse_structure_auto, write_mmcif, write_multi_model_pdb, write_pdb,
+    SdfPoseRecord, finalize_biomolecule, load_dcd_frames, parse_fasta, parse_mmcif, parse_pdb,
+    parse_sdf_poses, parse_structure_auto, write_mmcif, write_multi_model_pdb, write_pdb,
 };
 pub use model::{
     Atom, BasePair3D, BioStructError, Biomolecule, Bond, Chain, Disulfide, MAX_BIOMOL_ATOMS,
@@ -155,6 +155,47 @@ END
         let dx = "object 1 class gridpositions counts 2 2 2\norigin 0 0 0\ndelta 1 0 0\ndelta 0 1 0\ndelta 0 0 1\nobject 3 class array type double rank 0 items 8 data follows\n1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0\n";
         let gdx = parse_dx_map("dx_test", dx)?;
         assert_eq!(gdx.dims, [2, 2, 2]);
+
+        // MLP lipophilicity potential check
+        let mlp = compute_per_atom_mlp(&mol, 8.0);
+        assert_eq!(mlp.len(), mol.atoms.len());
+
+        // Multi-pose V2000 SDF parsing test
+        let sdf = "\
+pose_alpha
+  DockCraft
+
+  2  1  0  0  0  0  0  0  0  0999 V2000
+    1.0000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+    2.4000    0.0000    0.0000 O   0  0  0  0  0  0  0  0  0  0  0  0
+  1  2  2  0  0  0  0
+M  END
+>  <Vina_kcal>
+-8.45
+
+$$$$
+pose_beta
+  DockCraft
+
+  2  1  0  0  0  0  0  0  0  0999 V2000
+    3.0000    1.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+    4.3000    1.0000    0.0000 N   0  0  0  0  0  0  0  0  0  0  0  0
+  1  2  1  0  0  0  0
+M  END
+>  <Vina_kcal>
+-7.90
+
+$$$$
+";
+        let poses = parse_sdf_poses(sdf)?;
+        assert_eq!(poses.len(), 2);
+        assert_eq!(poses[0].title, "pose_alpha");
+        assert_eq!(
+            poses[0].properties.get("Vina_kcal").map(String::as_str),
+            Some("-8.45")
+        );
+        assert_eq!(poses[0].molecule.bonds.len(), 1);
+        assert_eq!(poses[0].molecule.bonds[0].order, 2);
         Ok(())
     }
 }

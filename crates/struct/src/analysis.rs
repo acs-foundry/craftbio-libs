@@ -330,3 +330,105 @@ pub fn compute_dipole_moment(mol: &Biomolecule) -> DipoleMomentReport {
         chain_charges,
     }
 }
+
+/// Atomic lipophilicity weight (Broto-Moreau / Wildman-Crippen inspired scale, negative = polar/hydrophilic,
+/// positive = lipophilic/hydrophobic) for ChimeraX-style 3D Molecular Lipophilicity Potential (`MLP`).
+#[must_use]
+fn atom_lipophilicity_weight(a: &Atom) -> f64 {
+    match a.res_class {
+        ResidueClass::Protein => {
+            let elem = a.element.as_str();
+            match elem {
+                "O" => -0.78,
+                "N" => {
+                    if a.formal_charge > 0.1 {
+                        -1.15
+                    } else {
+                        -0.62
+                    }
+                }
+                "S" => 0.45,
+                "C" => {
+                    // Distinguish aromatic / aliphatic sidechain carbons vs backbone carbonyl C
+                    if a.name == "C" {
+                        -0.20
+                    } else if a.name == "CA" {
+                        0.05
+                    } else {
+                        match a.res_code {
+                            'F' | 'W' | 'I' | 'L' | 'V' | 'M' => 0.85,
+                            'Y' | 'P' | 'A' | 'C' => 0.55,
+                            'D' | 'E' | 'K' | 'R' | 'N' | 'Q' => -0.15,
+                            _ => 0.25,
+                        }
+                    }
+                }
+                _ => 0.0,
+            }
+        }
+        ResidueClass::Rna | ResidueClass::Dna => match a.element.as_str() {
+            "P" | "O" => -0.95,
+            "N" => -0.55,
+            "C" => 0.28,
+            _ => -0.2,
+        },
+        ResidueClass::Ion | ResidueClass::Water => -1.10,
+        ResidueClass::Ligand => match a.element.as_str() {
+            "C" => 0.65,
+            "F" | "CL" | "BR" | "I" => 0.72,
+            "S" => 0.35,
+            "N" => -0.55,
+            "O" => -0.72,
+            "P" => -0.60,
+            _ => 0.0,
+        },
+    }
+}
+
+/// Evaluate smooth 3D Molecular Lipophilicity Potential (`MLP`) at arbitrary 3D surface or atomic
+/// points using an exponential distance kernel (`exp(-d / 2.0)` within `radius_a`, default `8.0 Å`).
+/// Values typically span `[-1.0, +1.0]` (negative = hydrophilic cyan, positive = lipophilic gold).
+#[must_use]
+pub fn compute_mlp_at_points(mol: &Biomolecule, points: &[[f64; 3]], radius_a: f64) -> Vec<f32> {
+    let srcs: Vec<([f64; 3], f64)> = mol
+        .atoms
+        .iter()
+        .filter(|a| a.res_class != ResidueClass::Water && a.element != "H")
+        .map(|a| (a.coords, atom_lipophilicity_weight(a)))
+        .collect();
+    if srcs.is_empty() {
+        return vec![0.0; points.len()];
+    }
+    let r_lim = radius_a.clamp(3.0, 14.0);
+    let r_lim2 = r_lim * r_lim;
+    points
+        .par_iter()
+        .map(|&p| {
+            let mut num = 0.0_f64;
+            let mut den = 0.0_f64;
+            for &(c, f_i) in &srcs {
+                let dx = p[0] - c[0];
+                let dy = p[1] - c[1];
+                let dz = p[2] - c[2];
+                let d2 = dx * dx + dy * dy + dz * dz;
+                if d2 <= r_lim2 {
+                    let w = (-d2.sqrt() * 0.5).exp();
+                    num += f_i * w;
+                    den += w;
+                }
+            }
+            if den > 1e-8 {
+                (num / den).clamp(-1.2, 1.2) as f32
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
+/// Compute per-atom 3D Molecular Lipophilicity Potential (`MLP`) for ChimeraX-style `color mlp`.
+#[must_use]
+pub fn compute_per_atom_mlp(mol: &Biomolecule, radius_a: f64) -> Vec<f32> {
+    let pts: Vec<[f64; 3]> = mol.atoms.iter().map(|a| a.coords).collect();
+    compute_mlp_at_points(mol, &pts, radius_a)
+}

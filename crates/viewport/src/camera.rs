@@ -14,6 +14,23 @@ pub struct Camera3D {
     pub distance: f32,
     pub fov_y_rad: f32,
     pub orthographic: bool,
+    /// Enable ChimeraX Side-View / PyMOL slab near & far clipping planes centered on `target`.
+    #[serde(default)]
+    pub clip_slab_enabled: bool,
+    /// Slab half-depth toward the camera from `target` (Å) when `clip_slab_enabled` is true.
+    #[serde(default = "default_clip_near_a")]
+    pub clip_near_a: f32,
+    /// Slab half-depth behind `target` away from camera (Å) when `clip_slab_enabled` is true.
+    #[serde(default = "default_clip_far_a")]
+    pub clip_far_a: f32,
+}
+
+fn default_clip_near_a() -> f32 {
+    35.0
+}
+
+fn default_clip_far_a() -> f32 {
+    60.0
 }
 
 impl Default for Camera3D {
@@ -25,6 +42,9 @@ impl Default for Camera3D {
             distance: 55.0,
             fov_y_rad: 42.0_f32.to_radians(),
             orthographic: false,
+            clip_slab_enabled: false,
+            clip_near_a: default_clip_near_a(),
+            clip_far_a: default_clip_far_a(),
         }
     }
 }
@@ -76,8 +96,26 @@ impl Camera3D {
 
     pub fn focus_on_biomolecule(&mut self, mol: &Biomolecule) {
         let (_, _, center, radius) = mol.bounds();
+        self.focus_on_bounds(center, radius);
+    }
+
+    pub fn focus_on_bounds(&mut self, center: [f64; 3], radius: f64) {
         self.target = [center[0] as f32, center[1] as f32, center[2] as f32];
-        self.distance = ((radius as f32) * 2.55).clamp(16.0, 320.0);
+        self.distance = ((radius as f32) * 2.55).clamp(12.0, 360.0);
+    }
+
+    /// Active `(near, far)` view-space clipping planes in Ångströms.
+    #[must_use]
+    pub fn clip_planes(&self) -> (f32, f32) {
+        if self.clip_slab_enabled {
+            let near = (self.distance - self.clip_near_a.max(0.5)).max(0.5);
+            let far = (self.distance + self.clip_far_a.max(0.5)).max(near + 1.0);
+            (near, far)
+        } else {
+            let near = (self.distance * 0.02).clamp(0.5, 4.0);
+            let far = (self.distance * 6.0).max(500.0);
+            (near, far)
+        }
     }
 
     /// Column-major 4×4 `View * Projection` matrix for WGSL (`z in [0, 1]`).
@@ -91,8 +129,7 @@ impl Camera3D {
             [right[2], up[2], -fwd[2], 0.0],
             [-dot3(right, eye), -dot3(up, eye), dot3(fwd, eye), 1.0],
         ];
-        let near = (self.distance * 0.02).clamp(0.5, 4.0);
-        let far = (self.distance * 6.0).max(500.0);
+        let (near, far) = self.clip_planes();
         let a = aspect.max(0.1);
         let proj = if self.orthographic {
             let half_h = self.distance * (0.5 * self.fov_y_rad).tan();

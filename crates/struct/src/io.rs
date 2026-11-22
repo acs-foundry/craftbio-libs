@@ -659,10 +659,193 @@ pub fn parse_mmcif(id: &str, cif_text: &str) -> Result<Biomolecule, BioStructErr
     finalize_biomolecule(id.to_string(), id.to_string(), atoms, Vec::new(), false)
 }
 
-/// Auto-detect PDB vs mmCIF and parse.
+/// Single parsed SDF record (3D ligand pose + preserved `<TAG>` properties).
+#[derive(Debug, Clone)]
+pub struct SdfPoseRecord {
+    pub title: String,
+    pub molecule: Biomolecule,
+    pub properties: HashMap<String, String>,
+}
+
+/// Parse a V2000 single- or multi-pose SDF text into `SdfPoseRecord` entries (`$$$$`-delimited).
+pub fn parse_sdf_poses(raw: &str) -> Result<Vec<SdfPoseRecord>, BioStructError> {
+    if raw.trim().is_empty() {
+        return Err(BioStructError::EmptyInput);
+    }
+    let mut out = Vec::new();
+    for (rec_idx, raw_chunk) in raw.split("$$$$").enumerate() {
+        let chunk = raw_chunk.trim_start_matches(['\r', '\n']);
+        if !chunk.contains("M  END") && !chunk.contains("V2000") {
+            continue;
+        }
+        let lines: Vec<&str> = chunk.lines().collect();
+        if lines.len() < 4 {
+            continue;
+        }
+        let title_raw = lines[0].trim();
+        let title = if title_raw.is_empty() {
+            format!("pose_{}", rec_idx + 1)
+        } else {
+            title_raw.to_string()
+        };
+        let counts = lines[3];
+        let natoms: usize = counts
+            .get(0..3)
+            .and_then(|s| s.trim().parse().ok())
+            .or_else(|| {
+                counts
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse().ok())
+            })
+            .unwrap_or(0);
+        let nbonds: usize = counts
+            .get(3..6)
+            .and_then(|s| s.trim().parse().ok())
+            .or_else(|| {
+                counts
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse().ok())
+            })
+            .unwrap_or(0);
+        if natoms == 0 || natoms > MAX_BIOMOL_ATOMS {
+            continue;
+        }
+        if 4 + natoms > lines.len() {
+            continue;
+        }
+        let mut atoms = Vec::with_capacity(natoms);
+        for i in 0..natoms {
+            let l = lines[4 + i];
+            let toks: Vec<&str> = l.split_whitespace().collect();
+            let (x, y, z, elem) = if l.len() >= 34 {
+                let px = l
+                    .get(0..10)
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                let py = l
+                    .get(10..20)
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                let pz = l
+                    .get(20..30)
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                let el = l.get(31..34).map(str::trim).unwrap_or("C");
+                (px, py, pz, el)
+            } else if toks.len() >= 4 {
+                (
+                    toks[0].parse().unwrap_or(0.0),
+                    toks[1].parse().unwrap_or(0.0),
+                    toks[2].parse().unwrap_or(0.0),
+                    toks[3],
+                )
+            } else {
+                continue;
+            };
+            let el_up = elem.to_ascii_uppercase();
+            let aname = format!("{el_up}{}", i + 1);
+            atoms.push(Atom {
+                serial: i + 1,
+                name: aname,
+                element: el_up,
+                res_name: "LIG".to_string(),
+                res_code: 'X',
+                res_class: ResidueClass::Ligand,
+                chain: 'L',
+                res_seq: 1,
+                icode: ' ',
+                coords: [x, y, z],
+                occupancy: 1.0,
+                b_factor: 0.0,
+                formal_charge: 0.0,
+                is_hetatm: true,
+            });
+        }
+        let mut explicit_bonds = Vec::with_capacity(nbonds);
+        let bond_start = 4 + natoms;
+        for b in 0..nbonds {
+            let Some(&bl) = lines.get(bond_start + b) else {
+                break;
+            };
+            if bl.starts_with("M  ") {
+                break;
+            }
+            let a1: usize = bl
+                .get(0..3)
+                .and_then(|s| s.trim().parse().ok())
+                .or_else(|| bl.split_whitespace().next().and_then(|s| s.parse().ok()))
+                .unwrap_or(0);
+            let a2: usize = bl
+                .get(3..6)
+                .and_then(|s| s.trim().parse().ok())
+                .or_else(|| bl.split_whitespace().nth(1).and_then(|s| s.parse().ok()))
+                .unwrap_or(0);
+            let ord: u8 = bl
+                .get(6..9)
+                .and_then(|s| s.trim().parse().ok())
+                .or_else(|| bl.split_whitespace().nth(2).and_then(|s| s.parse().ok()))
+                .unwrap_or(1);
+            if a1 >= 1 && a2 >= 1 && a1 <= atoms.len() && a2 <= atoms.len() {
+                explicit_bonds.push(Bond {
+                    a: a1 - 1,
+                    b: a2 - 1,
+                    order: ord.clamp(1, 4),
+                });
+            }
+        }
+        // Parse SDF properties `>  <TAG>`
+        let mut properties = HashMap::new();
+        let mut li = bond_start + nbonds;
+        while li < lines.len() {
+            let line = lines[li].trim();
+            if line.starts_with('>')
+                && let Some(s) = line.find('<')
+                && let Some(e) = line[s + 1..].find('>')
+            {
+                let key = line[s + 1..s + 1 + e].trim().to_string();
+                let mut vals = Vec::new();
+                li += 1;
+                while li < lines.len() && !lines[li].trim().is_empty() {
+                    vals.push(lines[li].trim());
+                    li += 1;
+                }
+                properties.insert(key, vals.join("\n"));
+            }
+            li += 1;
+        }
+        if let Ok(mut mol) =
+            finalize_biomolecule(title.clone(), title.clone(), atoms, Vec::new(), false)
+        {
+            if !explicit_bonds.is_empty() {
+                mol.bonds = explicit_bonds;
+            }
+            out.push(SdfPoseRecord {
+                title,
+                molecule: mol,
+                properties,
+            });
+        }
+    }
+    if out.is_empty() {
+        return Err(BioStructError::Parse(
+            "no valid V2000 SDF molecule records found".to_string(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Auto-detect PDB, mmCIF, or V2000 SDF and parse.
 pub fn parse_structure_auto(id: &str, text: &str) -> Result<Biomolecule, BioStructError> {
     if text.contains("_atom_site.") {
         parse_mmcif(id, text)
+    } else if text.contains("V2000") && text.contains("M  END") {
+        let mut recs = parse_sdf_poses(text)?;
+        recs.drain(..)
+            .next()
+            .map(|r| r.molecule)
+            .ok_or_else(|| BioStructError::Parse("empty SDF".to_string()))
     } else {
         parse_pdb(id, text)
     }

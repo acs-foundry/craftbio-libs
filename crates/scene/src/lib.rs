@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use craft_ipc::client::Client;
 use craft_ipc::discovery::{Discovery, InstanceRecord, RuntimeDir};
@@ -62,6 +62,7 @@ pub enum ColorScheme {
     BfactorPlddt,
     Sap3D,
     ElectrostaticEsp,
+    LipophilicityMlp,
     CustomHighlight,
 }
 
@@ -76,7 +77,162 @@ impl ColorScheme {
             Self::BfactorPlddt => "pLDDT / B-Factor",
             Self::Sap3D => "3D SAP Hydrophobicity",
             Self::ElectrostaticEsp => "Electrostatic Potential (ESP)",
+            Self::LipophilicityMlp => "Lipophilicity (MLP)",
             Self::CustomHighlight => "Module Highlights",
+        }
+    }
+}
+
+/// ChimeraX / PyMOL studio lighting preset shared across GPU & headless 4K renderers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LightingPreset {
+    #[default]
+    Soft,
+    Flat,
+    Full,
+    Studio,
+    PublicationWhite,
+}
+
+impl LightingPreset {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Soft => "ChimeraX Soft (SSAO)",
+            Self::Flat => "Flat Diagram",
+            Self::Full => "Full Specular",
+            Self::Studio => "Dark Studio Rim",
+            Self::PublicationWhite => "PyMOL Pub White",
+        }
+    }
+
+    #[must_use]
+    pub fn shader_id(self) -> f32 {
+        match self {
+            Self::Soft => 0.0,
+            Self::Flat => 1.0,
+            Self::Full => 2.0,
+            Self::Studio => 3.0,
+            Self::PublicationWhite => 4.0,
+        }
+    }
+}
+
+/// 3D Docking GridBox exchanged bidirectionally between `BiomolCraft` and `DockCraft`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct GridBox3D {
+    pub center: [f64; 3],
+    pub size: [f64; 3],
+    pub spacing: f64,
+}
+
+/// Synchronous selection-to-GridBox snapshot served by `BiomolCraft` over `biomol.get_selection_box`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectionBoxSnapshot {
+    pub grid_box: GridBox3D,
+    pub padding_a: f64,
+    pub source_model: String,
+    pub selected_residues: Vec<String>,
+    pub heavy_atoms: usize,
+}
+
+/// Per-atom SeeSAR HYDE v2 free-energy corona for `ViewDockX` 3D visualization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HydeAtomCorona {
+    pub atom_index: usize,
+    pub atom_name: String,
+    pub element: String,
+    pub coords: [f64; 3],
+    pub delta_g_kcal: f64,
+    pub corona_radius_a: f32,
+    pub corona_rgba: [f32; 4],
+    pub diagnostic: String,
+}
+
+/// Rotatable bond torsion traffic-light overlay (`Green` / `Yellow` / `Red`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TorsionBondLight {
+    pub from: [f64; 3],
+    pub to: [f64; 3],
+    pub status: String,
+    pub pattern: String,
+    pub dihedral_deg: f64,
+    pub strain_kcal: f64,
+    pub rgba: [f32; 4],
+}
+
+/// Single docked pose entry with scores, HYDE coronas, torsion lights, and 3D interactions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DockPoseEntry {
+    pub pose_id: usize,
+    pub name: String,
+    pub canonical_smiles: Option<String>,
+    pub sdf_block: String,
+    pub vina_kcal: f64,
+    pub hyde_kcal: Option<f64>,
+    pub consensus_kcal: Option<f64>,
+    pub cnn_score: Option<f64>,
+    pub estimated_ki_nm: Option<f64>,
+    pub ligand_efficiency: Option<f64>,
+    pub mpo_score: Option<f64>,
+    pub posebusters_valid: Option<bool>,
+    pub posebusters_summary: Option<String>,
+    /// `[green, yellow, red]` torsion counts.
+    pub torsion_counts: Option<[usize; 3]>,
+    #[serde(default)]
+    pub hyde_coronas: Vec<HydeAtomCorona>,
+    #[serde(default)]
+    pub torsion_lights: Vec<TorsionBondLight>,
+    #[serde(default)]
+    pub interaction_lines: Vec<LineOverlay>,
+}
+
+/// Complete rich docking & SBDD payload exchanged between `DockCraft` and `BiomolCraft` (`ViewDockX`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DockCraftSceneBundle {
+    pub schema_version: String,
+    pub title: String,
+    pub source_app: String,
+    pub receptor_name: String,
+    pub receptor_pdb_path: Option<String>,
+    pub receptor_pdb_inline: Option<String>,
+    pub grid_box: Option<GridBox3D>,
+    #[serde(default)]
+    pub poses: Vec<DockPoseEntry>,
+    #[serde(default)]
+    pub pharmacophore_spheres: Vec<SphereOverlay>,
+    #[serde(default)]
+    pub pharmacophore_vectors: Vec<LineOverlay>,
+    #[serde(default)]
+    pub selectivity_dmif_hotspots: Vec<SphereOverlay>,
+    #[serde(default)]
+    pub bridging_waters: Vec<SphereOverlay>,
+    /// Optional per-residue scalar override `(chain, res_seq, value, metric_label)` e.g. MD RMSF or MM/GBSA.
+    #[serde(default)]
+    pub residue_metric_overrides: Vec<(char, i32, f64, String)>,
+    pub trajectory_dcd_path: Option<String>,
+    #[serde(default)]
+    pub provenance: Vec<ProvenanceEntry>,
+}
+
+impl Default for DockCraftSceneBundle {
+    fn default() -> Self {
+        Self {
+            schema_version: "dockcraft-bundle/v1".to_string(),
+            title: "DockCraft ViewDockX Session".to_string(),
+            source_app: "dockcraft".to_string(),
+            receptor_name: "receptor".to_string(),
+            receptor_pdb_path: None,
+            receptor_pdb_inline: None,
+            grid_box: None,
+            poses: Vec::new(),
+            pharmacophore_spheres: Vec::new(),
+            pharmacophore_vectors: Vec::new(),
+            selectivity_dmif_hotspots: Vec::new(),
+            bridging_waters: Vec::new(),
+            residue_metric_overrides: Vec::new(),
+            trajectory_dcd_path: None,
+            provenance: Vec::new(),
         }
     }
 }
@@ -171,6 +327,7 @@ pub enum InboundLinkCommand {
         source_app: String,
     },
     LoadScene(Box<CraftSceneDocument>),
+    LoadDockCraftBundle(Box<DockCraftSceneBundle>),
     RunDsl {
         command: String,
         source_app: String,
@@ -180,6 +337,7 @@ pub enum InboundLinkCommand {
 struct QueueSink {
     app_name: String,
     inbox: Arc<Mutex<Vec<InboundLinkCommand>>>,
+    selection_box: Arc<RwLock<Option<SelectionBoxSnapshot>>>,
 }
 
 impl ControlSink for QueueSink {
@@ -247,6 +405,50 @@ impl ControlSink for QueueSink {
                     json!({ "ok": false, "error": format!("invalid CraftSceneDocument: {e}") })
                 }
             },
+            "biomol.load_dockcraft_bundle" => {
+                match serde_json::from_value::<DockCraftSceneBundle>(params) {
+                    Ok(bundle) => {
+                        let title = bundle.title.clone();
+                        let pose_count = bundle.poses.len();
+                        if let Ok(mut q) = self.inbox.lock() {
+                            q.push(InboundLinkCommand::LoadDockCraftBundle(Box::new(bundle)));
+                        }
+                        json!({
+                            "ok": true,
+                            "result": { "queued": true, "title": title, "poses": pose_count }
+                        })
+                    }
+                    Err(e) => {
+                        json!({ "ok": false, "error": format!("invalid DockCraftSceneBundle: {e}") })
+                    }
+                }
+            }
+            "biomol.get_selection_box" => {
+                let req_pad = params
+                    .get("padding")
+                    .and_then(Value::as_f64)
+                    .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 20.0);
+                match self.selection_box.read() {
+                    Ok(guard) => {
+                        if let Some(mut snap) = guard.clone() {
+                            if let Some(p) = req_pad {
+                                let delta = 2.0 * (p - snap.padding_a);
+                                for s in &mut snap.grid_box.size {
+                                    *s = (*s + delta).clamp(12.0, 64.0);
+                                }
+                                snap.padding_a = p;
+                            }
+                            json!({ "ok": true, "result": snap })
+                        } else {
+                            json!({
+                                "ok": false,
+                                "error": "no active selection or GridBox in BiomolCraft (select binding-site residues or set GridBox in ViewDockX first)"
+                            })
+                        }
+                    }
+                    Err(_) => json!({ "ok": false, "error": "selection box state unavailable" }),
+                }
+            }
             "biomol.run_dsl" => {
                 if let Some(cmd) = params.get("command").and_then(Value::as_str) {
                     let src = params
@@ -307,6 +509,7 @@ impl Frames for NoopFrames {
 pub struct CraftBioLinkServer {
     server: Server,
     inbox: Arc<Mutex<Vec<InboundLinkCommand>>>,
+    selection_box: Arc<RwLock<Option<SelectionBoxSnapshot>>>,
 }
 
 impl CraftBioLinkServer {
@@ -317,9 +520,11 @@ impl CraftBioLinkServer {
         runtime: Option<RuntimeDir>,
     ) -> Result<Self, SceneError> {
         let inbox = Arc::new(Mutex::new(Vec::new()));
+        let selection_box = Arc::new(RwLock::new(None));
         let sink = Arc::new(QueueSink {
             app_name: app.to_string(),
             inbox: Arc::clone(&inbox),
+            selection_box: Arc::clone(&selection_box),
         });
         let server = Server::start(ServerConfig {
             app: app.to_string(),
@@ -331,7 +536,18 @@ impl CraftBioLinkServer {
             activate: Arc::new(NoopActivate),
             frames: Arc::new(NoopFrames),
         })?;
-        Ok(Self { server, inbox })
+        Ok(Self {
+            server,
+            inbox,
+            selection_box,
+        })
+    }
+
+    /// Update the live selection-derived `GridBox` snapshot served synchronously to `DockCraft`.
+    pub fn set_selection_box(&self, snap: Option<SelectionBoxSnapshot>) {
+        if let Ok(mut guard) = self.selection_box.write() {
+            *guard = snap;
+        }
     }
 
     #[must_use]
@@ -433,7 +649,48 @@ pub fn send_trajectory_via_craft_link(
     Ok(reply)
 }
 
-/// Convenience helper for sibling CraftBio apps (`biocraft`, `dockcraft`, `chemcraft`, `admetcraft`):
+/// Send a rich `DockCraftSceneBundle` (`ViewDockX`) to a live `BiomolCraft` instance via Craft Link v1.
+pub fn push_dockcraft_bundle_via_craft_link(
+    target: &InstanceRecord,
+    bundle: &DockCraftSceneBundle,
+) -> Result<Value, SceneError> {
+    let mut client = Client::connect(target)?;
+    let params = serde_json::to_value(bundle)?;
+    let reply = client.call("biomol.load_dockcraft_bundle", params)?;
+    Ok(reply)
+}
+
+/// Synchronously query the live 3D selection / `GridBox` from a running `BiomolCraft` instance.
+pub fn request_selection_box_from_biomolcraft(
+    target: &InstanceRecord,
+    padding_a: Option<f64>,
+) -> Result<SelectionBoxSnapshot, SceneError> {
+    let mut client = Client::connect(target)?;
+    let params = match padding_a {
+        Some(p) => json!({ "padding": p }),
+        None => json!({}),
+    };
+    let reply = client.call("biomol.get_selection_box", params)?;
+    let snap: SelectionBoxSnapshot = serde_json::from_value(reply)?;
+    Ok(snap)
+}
+
+/// Discover the first live `biomolcraft` instance and synchronously fetch its 3D selection `GridBox`.
+pub fn discover_and_request_selection_box(
+    runtime: Option<RuntimeDir>,
+    padding_a: Option<f64>,
+) -> Result<SelectionBoxSnapshot, SceneError> {
+    let live = discover_craft_instances(runtime, Some("biomolcraft"))?;
+    let target = live.first().ok_or_else(|| {
+        SceneError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no running BiomolCraft instance found on Craft Link v1 (launch `biomolcraft` first)",
+        ))
+    })?;
+    request_selection_box_from_biomolcraft(target, padding_a)
+}
+
+/// Convenience helper for sibling CraftBio apps (`dockcraft`, `chemcraft`, `admetcraft`):
 /// discovers the first live `biomolcraft` instance over Craft Link v1 and sends a PDB + optional module hint.
 pub fn push_pdb_to_live_biomolcraft(
     source_app: &str,
@@ -455,7 +712,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn craft_link_v1_roundtrips_biomolecular_scene_over_unix_socket()
+    fn craft_link_v1_roundtrips_biomolecular_scene_and_dockcraft_bidirectional_rpc()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir_path = std::env::temp_dir().join(format!("craftbio_ipc_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir_path);
@@ -467,8 +724,20 @@ mod tests {
         }
 
         let runtime = RuntimeDir::at(dir_path.clone())?;
-        let srv = CraftBioLinkServer::start("biomolcraft", "0.1.0", Some(runtime.clone()))?;
-        let found = discover_craft_instances(Some(runtime), Some("biomolcraft"))?;
+        let srv = CraftBioLinkServer::start("biomolcraft", "0.4.0", Some(runtime.clone()))?;
+        srv.set_selection_box(Some(SelectionBoxSnapshot {
+            grid_box: GridBox3D {
+                center: [12.5, 4.0, -3.2],
+                size: [20.0, 20.0, 20.0],
+                spacing: 0.375,
+            },
+            padding_a: 5.0,
+            source_model: "1KE6".to_string(),
+            selected_residues: vec!["A:83 LEU".to_string(), "A:81 GLU".to_string()],
+            heavy_atoms: 18,
+        }));
+
+        let found = discover_craft_instances(Some(runtime.clone()), Some("biomolcraft"))?;
         assert!(
             !found.is_empty(),
             "expected to discover live biomolcraft instance"
@@ -476,14 +745,14 @@ mod tests {
 
         let doc = CraftSceneDocument {
             title: "Trastuzumab-HER2 Live Sync".to_string(),
-            source_app: "biocraft".to_string(),
+            source_app: "biomolcraft".to_string(),
             ..Default::default()
         };
         let reply = push_scene_via_craft_link(&found[0], &doc)?;
         assert_eq!(reply.get("queued").and_then(Value::as_bool), Some(true));
         let r2 = send_open_pdb_via_craft_link(
             &found[0],
-            "biocraft",
+            "chemcraft",
             "/tmp/1N8Z.pdb",
             Some("antibodies"),
         )?;
@@ -496,8 +765,42 @@ mod tests {
         )?;
         assert_eq!(r3.get("queued").and_then(Value::as_bool), Some(true));
 
+        let dock_bundle = DockCraftSceneBundle {
+            title: "CDK2 ViewDockX Test".to_string(),
+            receptor_name: "1KE6".to_string(),
+            poses: vec![DockPoseEntry {
+                pose_id: 1,
+                name: "Staurosporine_Mode1".to_string(),
+                canonical_smiles: None,
+                sdf_block: String::new(),
+                vina_kcal: -9.8,
+                hyde_kcal: Some(-10.4),
+                consensus_kcal: Some(-10.0),
+                cnn_score: None,
+                estimated_ki_nm: Some(45.0),
+                ligand_efficiency: Some(0.32),
+                mpo_score: Some(4.8),
+                posebusters_valid: Some(true),
+                posebusters_summary: Some("5/5 PASS".to_string()),
+                torsion_counts: Some([3, 1, 0]),
+                hyde_coronas: Vec::new(),
+                torsion_lights: Vec::new(),
+                interaction_lines: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let r4 = push_dockcraft_bundle_via_craft_link(&found[0], &dock_bundle)?;
+        assert_eq!(r4.get("queued").and_then(Value::as_bool), Some(true));
+        assert_eq!(r4.get("poses").and_then(Value::as_u64), Some(1));
+
+        // Synchronous selection-to-GridBox RPC from DockCraft -> BiomolCraft
+        let snap = discover_and_request_selection_box(Some(runtime), Some(6.0))?;
+        assert_eq!(snap.source_model, "1KE6");
+        assert!((snap.grid_box.size[0] - 22.0).abs() < 1e-6);
+        assert_eq!(snap.selected_residues.len(), 2);
+
         let cmds = srv.drain_inbox();
-        assert_eq!(cmds.len(), 3);
+        assert_eq!(cmds.len(), 4);
         srv.shutdown();
         let _ = std::fs::remove_dir_all(&dir_path);
         Ok(())
