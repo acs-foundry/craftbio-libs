@@ -700,6 +700,254 @@ pub fn write_pdb(mol: &Biomolecule) -> String {
     out
 }
 
+/// Write a multi-model `MODEL`/`ENDMDL` PDB trajectory (for ANM modes, Langevin MD, or OpenMM MD).
+#[must_use]
+pub fn write_multi_model_pdb(mol: &Biomolecule) -> String {
+    if mol.frames.is_empty() {
+        return write_pdb(mol);
+    }
+    let mut out = String::with_capacity(mol.atoms.len() * 82 * mol.frames.len().min(64) + 256);
+    let _ = writeln!(out, "TITLE     {} ({} frames)", mol.title, mol.frames.len());
+    for (f_idx, frame) in mol.frames.iter().enumerate() {
+        let _ = writeln!(out, "MODEL     {:>4}", f_idx + 1);
+        for (idx, a) in mol.atoms.iter().enumerate() {
+            let coords = frame.coords.get(idx).copied().unwrap_or(a.coords);
+            let rec = if a.is_hetatm { "HETATM" } else { "ATOM  " };
+            let aname = if a.name.len() < 4 {
+                format!(" {:<3}", a.name)
+            } else {
+                a.name.chars().take(4).collect()
+            };
+            let rname: String = a.res_name.chars().take(3).collect();
+            let serial = (idx + 1) % 100_000;
+            let _ = writeln!(
+                out,
+                "{rec}{serial:>5} {aname} {rname:>3} {}{:>4}{}   {:>8.3}{:>8.3}{:>8.3}{:>6.2}{:>6.2}          {:>2}",
+                a.chain,
+                a.res_seq,
+                a.icode,
+                coords[0],
+                coords[1],
+                coords[2],
+                a.occupancy,
+                a.b_factor,
+                a.element
+            );
+        }
+        out.push_str("ENDMDL\n");
+    }
+    out.push_str("END\n");
+    out
+}
+
+/// Write standard mmCIF (`_atom_site`) text cleanly supporting large macromolecular assemblies.
+#[must_use]
+pub fn write_mmcif(mol: &Biomolecule) -> String {
+    let mut out = String::with_capacity(mol.atoms.len() * 76 + 512);
+    let safe_id: String = mol
+        .id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let _ = writeln!(
+        out,
+        "data_{}",
+        if safe_id.is_empty() {
+            "BIOMOL"
+        } else {
+            &safe_id
+        }
+    );
+    let _ = writeln!(out, "_struct.title '{}'", mol.title.replace('\'', ""));
+    out.push_str("loop_\n");
+    out.push_str("_atom_site.group_PDB\n");
+    out.push_str("_atom_site.id\n");
+    out.push_str("_atom_site.type_symbol\n");
+    out.push_str("_atom_site.label_atom_id\n");
+    out.push_str("_atom_site.label_comp_id\n");
+    out.push_str("_atom_site.auth_asym_id\n");
+    out.push_str("_atom_site.auth_seq_id\n");
+    out.push_str("_atom_site.Cartn_x\n");
+    out.push_str("_atom_site.Cartn_y\n");
+    out.push_str("_atom_site.Cartn_z\n");
+    out.push_str("_atom_site.occupancy\n");
+    out.push_str("_atom_site.B_iso_or_equiv\n");
+    for (idx, a) in mol.atoms.iter().enumerate() {
+        let grp = if a.is_hetatm { "HETATM" } else { "ATOM" };
+        let aname = if a.name.contains('\'') {
+            format!("\"{}\"", a.name)
+        } else {
+            a.name.clone()
+        };
+        let _ = writeln!(
+            out,
+            "{grp} {} {} {} {} {} {} {:.3} {:.3} {:.3} {:.2} {:.2}",
+            idx + 1,
+            a.element,
+            aname,
+            a.res_name,
+            a.chain,
+            a.res_seq,
+            a.coords[0],
+            a.coords[1],
+            a.coords[2],
+            a.occupancy,
+            a.b_factor
+        );
+    }
+    out.push_str("#\n");
+    out
+}
+
+/// Read a binary CHARMM / NAMD / OpenMM `.dcd` trajectory in 100% safe Rust and populate
+/// `mol.frames` (automatically matching heavy-atom or full-atom count and skipping optional
+/// 48-byte unit-cell crystal records). Returns the number of loaded frames.
+pub fn load_dcd_frames(mol: &mut Biomolecule, bytes: &[u8]) -> Result<usize, BioStructError> {
+    if bytes.len() < 100 {
+        return Err(BioStructError::Parse(
+            "DCD file too small (< 100 bytes)".to_string(),
+        ));
+    }
+    let read_u32 = |off: usize, le: bool| -> Result<u32, BioStructError> {
+        let slice = bytes
+            .get(off..off + 4)
+            .ok_or_else(|| BioStructError::Parse("unexpected EOF in DCD header".to_string()))?;
+        let arr: [u8; 4] = slice
+            .try_into()
+            .map_err(|_| BioStructError::Parse("invalid u32 slice".to_string()))?;
+        Ok(if le {
+            u32::from_le_bytes(arr)
+        } else {
+            u32::from_be_bytes(arr)
+        })
+    };
+    let read_f32 = |off: usize, le: bool| -> Result<f32, BioStructError> {
+        let slice = bytes
+            .get(off..off + 4)
+            .ok_or_else(|| BioStructError::Parse("unexpected EOF in DCD coords".to_string()))?;
+        let arr: [u8; 4] = slice
+            .try_into()
+            .map_err(|_| BioStructError::Parse("invalid f32 slice".to_string()))?;
+        Ok(if le {
+            f32::from_le_bytes(arr)
+        } else {
+            f32::from_be_bytes(arr)
+        })
+    };
+
+    let h0_le = read_u32(0, true)?;
+    let h0_be = read_u32(0, false)?;
+    let little_endian = if h0_le == 84 {
+        true
+    } else if h0_be == 84 {
+        false
+    } else {
+        return Err(BioStructError::Parse(format!(
+            "unrecognized DCD header length (le={h0_le}, be={h0_be}, expected 84)"
+        )));
+    };
+    if bytes.get(4..8) != Some(b"CORD") {
+        return Err(BioStructError::Parse("DCD magic is not 'CORD'".to_string()));
+    }
+    let has_extra_unitcell = read_u32(48, little_endian)? != 0;
+    let mut pos = 4 + 84 + 4; // skip first Fortran record
+
+    // Title block record
+    let title_len = read_u32(pos, little_endian)? as usize;
+    pos = pos
+        .checked_add(4 + title_len + 4)
+        .ok_or_else(|| BioStructError::Parse("DCD title block overflow".to_string()))?;
+    if pos + 12 > bytes.len() {
+        return Err(BioStructError::Parse(
+            "truncated DCD atom-count block".to_string(),
+        ));
+    }
+
+    // Atom count block (len == 4)
+    let natom_rec_len = read_u32(pos, little_endian)?;
+    if natom_rec_len != 4 {
+        return Err(BioStructError::Parse(format!(
+            "expected 4-byte DCD natom block, got {natom_rec_len}"
+        )));
+    }
+    let natoms = read_u32(pos + 4, little_endian)? as usize;
+    pos += 12;
+    if natoms == 0 || natoms > crate::model::MAX_BIOMOL_ATOMS {
+        return Err(BioStructError::Parse(format!(
+            "invalid DCD atom count {natoms}"
+        )));
+    }
+    if natoms != mol.atoms.len() {
+        return Err(BioStructError::Parse(format!(
+            "DCD atom count ({natoms}) does not match loaded structure ({} atoms)",
+            mol.atoms.len()
+        )));
+    }
+
+    let coord_rec_bytes = natoms * 4;
+    let mut frames = Vec::new();
+    const MAX_DCD_FRAMES: usize = 2000;
+    while pos + 8 <= bytes.len() && frames.len() < MAX_DCD_FRAMES {
+        // Optional 48-byte crystal unit cell record (6 f64 values)
+        if has_extra_unitcell {
+            let uc_len = read_u32(pos, little_endian)? as usize;
+            if uc_len == 48 {
+                pos += 4 + 48 + 4;
+                if pos + 8 > bytes.len() {
+                    break;
+                }
+            }
+        }
+        let mut axes = [Vec::new(), Vec::new(), Vec::new()];
+        let mut ok_frame = true;
+        for ax in &mut axes {
+            if pos + 4 + coord_rec_bytes + 4 > bytes.len() {
+                ok_frame = false;
+                break;
+            }
+            let rlen = read_u32(pos, little_endian)? as usize;
+            if rlen != coord_rec_bytes {
+                ok_frame = false;
+                break;
+            }
+            pos += 4;
+            let mut vals = Vec::with_capacity(natoms);
+            for i in 0..natoms {
+                vals.push(f64::from(read_f32(pos + i * 4, little_endian)?));
+            }
+            pos += coord_rec_bytes + 4;
+            *ax = vals;
+        }
+        if !ok_frame {
+            break;
+        }
+        let mut coords = Vec::with_capacity(natoms);
+        for i in 0..natoms {
+            coords.push([axes[0][i], axes[1][i], axes[2][i]]);
+        }
+        frames.push(TrajectoryFrame {
+            frame_index: frames.len(),
+            time_ps: frames.len() as f64,
+            coords,
+        });
+    }
+    if frames.is_empty() {
+        return Err(BioStructError::Parse(
+            "DCD contained 0 readable coordinate frames".to_string(),
+        ));
+    }
+    let n = frames.len();
+    mol.frames = frames;
+    mol.set_active_frame(0);
+    Ok(n)
+}
+
 /// Parse single- or multi-entry FASTA text into `(header, sequence)` pairs.
 pub fn parse_fasta(text: &str) -> Result<Vec<(String, String)>, BioStructError> {
     let trimmed = text.trim();

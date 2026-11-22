@@ -9,12 +9,17 @@ pub mod io;
 pub mod model;
 pub mod selection;
 
-pub use align::{RigidTransform, kabsch_superpose, matchmaker_align, needleman_wunsch_pairs};
+pub use align::{
+    RigidTransform, kabsch_superpose, matchmaker_align, needleman_wunsch_pairs,
+    smith_waterman_pairs,
+};
 pub use analysis::{
-    assign_secondary_structure, compute_esp_at_points, compute_per_atom_sap, compute_sasa,
+    DipoleMomentReport, assign_secondary_structure, compute_dipole_moment, compute_esp_at_points,
+    compute_per_atom_sap, compute_sasa,
 };
 pub use io::{
-    finalize_biomolecule, parse_fasta, parse_mmcif, parse_pdb, parse_structure_auto, write_pdb,
+    finalize_biomolecule, load_dcd_frames, parse_fasta, parse_mmcif, parse_pdb,
+    parse_structure_auto, write_mmcif, write_multi_model_pdb, write_pdb,
 };
 pub use model::{
     Atom, BasePair3D, BioStructError, Biomolecule, Bond, Chain, Disulfide, MAX_BIOMOL_ATOMS,
@@ -83,10 +88,52 @@ END
         let m_plddt = evaluate_selection(&mol, "b > 85", &named)?;
         assert_eq!(m_plddt.iter().filter(|&&b| b).count(), 5);
 
-        // Roundtrip write_pdb
+        // Roundtrip write_pdb & write_mmcif & dipole moment
         let out_pdb = write_pdb(&mol);
         let mol2 = parse_pdb("rt", &out_pdb)?;
         assert_eq!(mol2.atoms.len(), mol.atoms.len());
+
+        let out_cif = write_mmcif(&mol);
+        let mol3 = parse_mmcif("rt_cif", &out_cif)?;
+        assert_eq!(mol3.atoms.len(), mol.atoms.len());
+
+        let dip = compute_dipole_moment(&mol);
+        assert!(dip.dipole_magnitude_debye >= 0.0);
+
+        // Synthetic little-endian CHARMM/OpenMM DCD binary roundtrip test (2 frames)
+        let mut dcd = Vec::new();
+        let mut push_rec = |payload: &[u8]| {
+            let n = payload.len() as u32;
+            dcd.extend_from_slice(&n.to_le_bytes());
+            dcd.extend_from_slice(payload);
+            dcd.extend_from_slice(&n.to_le_bytes());
+        };
+        let mut hdr = vec![0u8; 84];
+        hdr[0..4].copy_from_slice(b"CORD");
+        hdr[4..8].copy_from_slice(&2u32.to_le_bytes());
+        push_rec(&hdr);
+        let mut title = vec![0u8; 84];
+        title[0..4].copy_from_slice(&1u32.to_le_bytes());
+        push_rec(&title);
+        push_rec(&(mol.atoms.len() as u32).to_le_bytes());
+        for f in 0..2 {
+            let mut xs = Vec::new();
+            let mut ys = Vec::new();
+            let mut zs = Vec::new();
+            for a in &mol.atoms {
+                xs.extend_from_slice(&((a.coords[0] + f as f64) as f32).to_le_bytes());
+                ys.extend_from_slice(&(a.coords[1] as f32).to_le_bytes());
+                zs.extend_from_slice(&(a.coords[2] as f32).to_le_bytes());
+            }
+            push_rec(&xs);
+            push_rec(&ys);
+            push_rec(&zs);
+        }
+        let mut mol_traj = mol.clone();
+        let loaded = load_dcd_frames(&mut mol_traj, &dcd)?;
+        assert_eq!(loaded, 2);
+        let multi = write_multi_model_pdb(&mol_traj);
+        assert!(multi.contains("MODEL        2"));
         Ok(())
     }
 }

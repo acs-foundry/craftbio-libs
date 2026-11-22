@@ -271,3 +271,62 @@ pub fn compute_esp_at_points(mol: &Biomolecule, points: &[[f64; 3]]) -> Vec<f32>
         })
         .collect()
 }
+
+/// 3D electrostatic dipole moment and net charge summary (`1 e·Å = 4.8032 Debye`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DipoleMomentReport {
+    pub net_charge_e: f64,
+    pub dipole_magnitude_debye: f64,
+    pub dipole_vector_debye: [f64; 3],
+    pub center_of_geometry: [f64; 3],
+    pub chain_charges: Vec<(char, f64)>,
+}
+
+/// Compute the 3D electrostatic dipole moment (Debye) referenced to geometric center
+/// (relevant for antibody viscosity / colloidal self-association and electrostatics).
+#[must_use]
+pub fn compute_dipole_moment(mol: &Biomolecule) -> DipoleMomentReport {
+    let center = mol.centroid();
+    let mut vec_ea = [0.0_f64; 3];
+    let mut net_q = 0.0_f64;
+    for a in &mol.atoms {
+        let q = a.formal_charge;
+        net_q += q;
+        if q.abs() > 1e-6 {
+            vec_ea[0] += q * (a.coords[0] - center[0]);
+            vec_ea[1] += q * (a.coords[1] - center[1]);
+            vec_ea[2] += q * (a.coords[2] - center[2]);
+        }
+    }
+    const E_ANGSTROM_TO_DEBYE: f64 = 4.80320425;
+    let d_vec = [
+        vec_ea[0] * E_ANGSTROM_TO_DEBYE,
+        vec_ea[1] * E_ANGSTROM_TO_DEBYE,
+        vec_ea[2] * E_ANGSTROM_TO_DEBYE,
+    ];
+    let mag = (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1] + d_vec[2] * d_vec[2]).sqrt();
+    let chain_charges: Vec<(char, f64)> = mol
+        .chains
+        .iter()
+        .map(|ch| {
+            let q: f64 = ch
+                .residues
+                .iter()
+                .flat_map(|r| r.atom_indices.iter())
+                .map(|&idx| mol.atoms[idx].formal_charge)
+                .sum();
+            (ch.id, (q * 100.0).round() / 100.0)
+        })
+        .collect();
+    DipoleMomentReport {
+        net_charge_e: (net_q * 100.0).round() / 100.0,
+        dipole_magnitude_debye: (mag * 100.0).round() / 100.0,
+        dipole_vector_debye: [
+            (d_vec[0] * 100.0).round() / 100.0,
+            (d_vec[1] * 100.0).round() / 100.0,
+            (d_vec[2] * 100.0).round() / 100.0,
+        ],
+        center_of_geometry: center,
+        chain_charges,
+    }
+}

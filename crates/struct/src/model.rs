@@ -157,6 +157,22 @@ impl Biomolecule {
         self.chains.iter().map(|c| c.id).collect()
     }
 
+    /// Geometric center of all atoms in the biomolecule.
+    #[must_use]
+    pub fn centroid(&self) -> [f64; 3] {
+        if self.atoms.is_empty() {
+            return [0.0; 3];
+        }
+        let mut s = [0.0_f64; 3];
+        for a in &self.atoms {
+            s[0] += a.coords[0];
+            s[1] += a.coords[1];
+            s[2] += a.coords[2];
+        }
+        let inv = 1.0 / (self.atoms.len() as f64);
+        [s[0] * inv, s[1] * inv, s[2] * inv]
+    }
+
     /// Bounding box `(min, max, center, radius)` of all atoms.
     #[must_use]
     pub fn bounds(&self) -> ([f64; 3], [f64; 3], [f64; 3], f64) {

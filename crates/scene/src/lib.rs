@@ -160,9 +160,21 @@ impl Default for CraftSceneDocument {
 /// Inbound Craft Link command received from a peer CraftBio / ArtCraft application.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InboundLinkCommand {
-    OpenPdb { path: String, source_app: String },
+    OpenPdb {
+        path: String,
+        source_app: String,
+        module_hint: Option<String>,
+    },
+    LoadTrajectory {
+        pdb_path: String,
+        dcd_path: String,
+        source_app: String,
+    },
     LoadScene(Box<CraftSceneDocument>),
-    RunDsl { command: String, source_app: String },
+    RunDsl {
+        command: String,
+        source_app: String,
+    },
 }
 
 struct QueueSink {
@@ -185,15 +197,42 @@ impl ControlSink for QueueSink {
                         .and_then(Value::as_str)
                         .unwrap_or("peer")
                         .to_string();
+                    let module_hint = params
+                        .get("module_hint")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
                     if let Ok(mut q) = self.inbox.lock() {
                         q.push(InboundLinkCommand::OpenPdb {
                             path: path.to_string(),
                             source_app: src,
+                            module_hint,
                         });
                     }
                     json!({ "ok": true, "result": { "queued": true, "path": path } })
                 } else {
                     json!({ "ok": false, "error": "missing 'path' parameter" })
+                }
+            }
+            "biomol.load_trajectory" => {
+                if let (Some(pdb_path), Some(dcd_path)) = (
+                    params.get("pdb_path").and_then(Value::as_str),
+                    params.get("dcd_path").and_then(Value::as_str),
+                ) {
+                    let src = params
+                        .get("source_app")
+                        .and_then(Value::as_str)
+                        .unwrap_or("peer")
+                        .to_string();
+                    if let Ok(mut q) = self.inbox.lock() {
+                        q.push(InboundLinkCommand::LoadTrajectory {
+                            pdb_path: pdb_path.to_string(),
+                            dcd_path: dcd_path.to_string(),
+                            source_app: src,
+                        });
+                    }
+                    json!({ "ok": true, "result": { "queued": true, "pdb_path": pdb_path, "dcd_path": dcd_path } })
+                } else {
+                    json!({ "ok": false, "error": "missing 'pdb_path' or 'dcd_path' parameter" })
                 }
             }
             "biomol.load_scene" => match serde_json::from_value::<CraftSceneDocument>(params) {
@@ -356,6 +395,61 @@ pub fn send_dsl_via_craft_link(
     Ok(reply)
 }
 
+/// Request a running `BiomolCraft` instance to open a PDB/mmCIF structure and optionally activate a module.
+pub fn send_open_pdb_via_craft_link(
+    target: &InstanceRecord,
+    source_app: &str,
+    pdb_path: &str,
+    module_hint: Option<&str>,
+) -> Result<Value, SceneError> {
+    let mut client = Client::connect(target)?;
+    let reply = client.call(
+        "biomol.open_pdb",
+        json!({
+            "source_app": source_app,
+            "path": pdb_path,
+            "module_hint": module_hint,
+        }),
+    )?;
+    Ok(reply)
+}
+
+/// Request a running `BiomolCraft` instance to load a structure + binary OpenMM `.dcd` trajectory.
+pub fn send_trajectory_via_craft_link(
+    target: &InstanceRecord,
+    source_app: &str,
+    pdb_path: &str,
+    dcd_path: &str,
+) -> Result<Value, SceneError> {
+    let mut client = Client::connect(target)?;
+    let reply = client.call(
+        "biomol.load_trajectory",
+        json!({
+            "source_app": source_app,
+            "pdb_path": pdb_path,
+            "dcd_path": dcd_path,
+        }),
+    )?;
+    Ok(reply)
+}
+
+/// Convenience helper for sibling CraftBio apps (`biocraft`, `dockcraft`, `chemcraft`, `admetcraft`):
+/// discovers the first live `biomolcraft` instance over Craft Link v1 and sends a PDB + optional module hint.
+pub fn push_pdb_to_live_biomolcraft(
+    source_app: &str,
+    pdb_path: &str,
+    module_hint: Option<&str>,
+) -> Result<Value, SceneError> {
+    let live = discover_craft_instances(None, Some("biomolcraft"))?;
+    let target = live.first().ok_or_else(|| {
+        SceneError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no running BiomolCraft instance found on Craft Link v1 (launch `biomolcraft` first)",
+        ))
+    })?;
+    send_open_pdb_via_craft_link(target, source_app, pdb_path, module_hint)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,9 +481,23 @@ mod tests {
         };
         let reply = push_scene_via_craft_link(&found[0], &doc)?;
         assert_eq!(reply.get("queued").and_then(Value::as_bool), Some(true));
+        let r2 = send_open_pdb_via_craft_link(
+            &found[0],
+            "biocraft",
+            "/tmp/1N8Z.pdb",
+            Some("antibodies"),
+        )?;
+        assert_eq!(r2.get("queued").and_then(Value::as_bool), Some(true));
+        let r3 = send_trajectory_via_craft_link(
+            &found[0],
+            "dockcraft",
+            "/tmp/1N8Z.pdb",
+            "/tmp/traj.dcd",
+        )?;
+        assert_eq!(r3.get("queued").and_then(Value::as_bool), Some(true));
 
         let cmds = srv.drain_inbox();
-        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds.len(), 3);
         srv.shutdown();
         let _ = std::fs::remove_dir_all(&dir_path);
         Ok(())
