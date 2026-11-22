@@ -1,0 +1,16 @@
+[package]
+name = "craftbio-struct"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Universal Biomolecular Structure IR (Proteins, Antibodies, Enzymes, ncRNA/mRNA/DNA, Ligands, Trajectories), DSSP, Shrake-Rupley SASA, ESP/SAP, Kabsch/MatchMaker alignment, and PyMOL/ChimeraX selection algebra"
+
+[lints]
+workspace = true
+
+[dependencies]
+rayon.workspace = true
+serde.workspace = true
+thiserror.workspace = true
