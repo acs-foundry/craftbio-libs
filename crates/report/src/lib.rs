@@ -12,21 +12,30 @@ pub use dossier::{
     write_biomol_html_dossier,
 };
 
-/// Resolve the shared CraftBio local data directory (`CRAFT_DATA_DIR` or `/home/acs/Datos/CraftBio`).
+/// Resolve the shared CraftBio local data directory.
+///
+/// `CRAFT_DATA_DIR` if set, otherwise `$XDG_DATA_HOME/CraftBio`, otherwise
+/// `$HOME/.local/share/CraftBio`. Set `CRAFT_DATA_DIR` to keep large assets off the root
+/// partition. No path is hardcoded for any particular machine.
 #[must_use]
 pub fn craft_data_dir() -> PathBuf {
-    if let Ok(env_dir) = std::env::var("CRAFT_DATA_DIR")
-        && !env_dir.trim().is_empty()
-    {
-        return PathBuf::from(env_dir);
+    let non_blank = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+
+    if let Some(dir) = non_blank("CRAFT_DATA_DIR") {
+        return PathBuf::from(dir);
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/acs".to_string());
-    let datos = PathBuf::from(&home).join("Datos").join("CraftBio");
-    if datos.exists() {
-        datos
-    } else {
-        PathBuf::from(home).join(".local/share/craftbio")
+    if let Some(xdg) = non_blank("XDG_DATA_HOME") {
+        return PathBuf::from(xdg).join("CraftBio");
     }
+    if let Some(home) = non_blank("HOME") {
+        return PathBuf::from(home).join(".local/share/CraftBio");
+    }
+    PathBuf::from("CraftBio")
 }
 
 /// Escape text safely for HTML/XML/SVG inclusion (prevents XSS and control-char corruption).
