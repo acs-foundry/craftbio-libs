@@ -64,17 +64,42 @@ fn tokenize(expr: &str) -> Vec<Tok> {
     out
 }
 
+/// Deepest nesting the selection parser will descend into before giving up.
+///
+/// `parse_unary` and `parse_primary` each recurse, so nesting depth is stack depth: without
+/// a budget a long enough run of `(` or `not` overflows the stack and **aborts the process**.
+/// That is not a panic, so `catch_unwind` cannot contain it, and every consumer of this
+/// crate — including servers that take selections from the network — inherits the fault.
+/// Hand-written selections nest a handful of levels; 128 is far beyond any real query.
+pub const MAX_SELECTION_DEPTH: usize = 128;
+
 struct Parser<'a> {
     mol: &'a Biomolecule,
     named: &'a HashMap<String, Vec<bool>>,
     toks: Vec<Tok>,
     pos: usize,
     res_ss_by_atom: Vec<SecondaryStructure>,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
     fn peek(&self) -> Option<&Tok> {
         self.toks.get(self.pos)
+    }
+
+    /// Descend one nesting level, refusing to go deeper than [`MAX_SELECTION_DEPTH`].
+    fn descend(&mut self) -> Result<(), BioStructError> {
+        self.depth += 1;
+        if self.depth > MAX_SELECTION_DEPTH {
+            return Err(BioStructError::Selection(format!(
+                "selection nests deeper than {MAX_SELECTION_DEPTH} levels"
+            )));
+        }
+        Ok(())
+    }
+
+    fn ascend(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
 
     fn next(&mut self) -> Option<Tok> {
@@ -114,7 +139,9 @@ impl<'a> Parser<'a> {
     fn parse_unary(&mut self) -> Result<Vec<bool>, BioStructError> {
         if self.peek() == Some(&Tok::Not) {
             self.next();
+            self.descend()?;
             let mut m = self.parse_unary()?;
+            self.ascend();
             for v in &mut m {
                 *v = !*v;
             }
@@ -127,7 +154,9 @@ impl<'a> Parser<'a> {
         let n = self.mol.atoms.len();
         match self.next() {
             Some(Tok::LParen) => {
+                self.descend()?;
                 let inner = self.parse_or()?;
+                self.ascend();
                 if self.next() != Some(Tok::RParen) {
                     return Err(BioStructError::Selection("unclosed '('".to_string()));
                 }
@@ -435,6 +464,7 @@ pub fn evaluate_selection(
         toks,
         pos: 0,
         res_ss_by_atom: res_ss,
+        depth: 0,
     };
     let mask = parser.parse_or()?;
     if parser.pos < parser.toks.len() {

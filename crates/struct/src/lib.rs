@@ -420,4 +420,42 @@ END
         assert_eq!(nodust.dims, vol.dims);
         Ok(())
     }
+
+    /// Audit finding F2-02 / F3-04: the selection parser recursed once per prefix operator
+    /// and once per parenthesis, with no depth budget. A deep expression overflowed the
+    /// stack and aborted the whole process — not a panic, so no `catch_unwind` could
+    /// contain it, and every consumer of this crate inherited the fault.
+    #[test]
+    fn deeply_nested_selections_return_an_error_instead_of_overflowing_the_stack()
+    -> Result<(), BioStructError> {
+        let pdb = "\
+ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 20.00           N
+ATOM      2  CA  ALA A   1       1.450   0.000   0.000  1.00 20.00           C
+ATOM      3  C   ALA A   1       2.050   1.380   0.000  1.00 20.00           C
+END
+";
+        let mol = parse_pdb("deep", pdb)?;
+        let named = HashMap::new();
+
+        for expr in [
+            format!("{}name CA{}", "(".repeat(20_000), ")".repeat(20_000)),
+            format!("{}name CA", "not ".repeat(20_000)),
+            format!("{}name CA{}", "(not ".repeat(10_000), ")".repeat(10_000)),
+        ] {
+            let got = evaluate_selection(&mol, &expr, &named);
+            assert!(
+                got.is_err(),
+                "a {} -character nested selection was accepted",
+                expr.len()
+            );
+        }
+
+        // Ordinary expressions, including genuinely nested ones, still evaluate.
+        let mask = evaluate_selection(&mol, "(name CA or name N) and not water", &named)?;
+        assert_eq!(mask.iter().filter(|m| **m).count(), 2);
+        let deep_but_sane = format!("{}name CA{}", "(".repeat(32), ")".repeat(32));
+        let mask = evaluate_selection(&mol, &deep_but_sane, &named)?;
+        assert_eq!(mask.iter().filter(|m| **m).count(), 1);
+        Ok(())
+    }
 }
