@@ -309,3 +309,96 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod race_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Both resolution paths hold while a symlink is being swapped underneath them.
+    ///
+    /// `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` is the normal path; the dirfd descent is
+    /// the fallback for kernels that answer `ENOSYS`, and on a modern kernel it is never reached
+    /// through the public API. Testing it therefore means calling it directly, which is why this
+    /// test lives beside the implementation: a consumer crate can only exercise the first path.
+    ///
+    /// (This test came from DockCraft, which carried a copy of this sandbox. The copy is gone; the
+    /// test is better placed here, where both paths are reachable.)
+    #[test]
+    fn both_resolution_paths_resist_symlink_races() -> Result<(), Box<dyn std::error::Error>> {
+        let base = std::env::temp_dir().join(format!("craftbio_race_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(root.join("race"))?;
+        std::fs::create_dir_all(&outside)?;
+        std::fs::write(outside.join("secret.txt"), b"OUTSIDE_SECRET")?;
+        std::fs::write(root.join("race/innocent.txt"), b"INSIDE")?;
+
+        let sandbox = PathSandbox::new(
+            Some(root.clone()),
+            Some(root.clone()),
+            DEFAULT_MAX_FILE_BYTES,
+        )?;
+
+        // A second thread keeps flipping race/secret.txt between a real file inside the root and
+        // a symlink pointing outside it.
+        let stop = Arc::new(AtomicBool::new(false));
+        let flipper = {
+            let stop = Arc::clone(&stop);
+            let root = root.clone();
+            let outside = outside.clone();
+            std::thread::spawn(move || {
+                let target = root.join("race/secret.txt");
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::fs::remove_file(&target);
+                    let _ = symlink(outside.join("secret.txt"), &target);
+                    let _ = std::fs::remove_file(&target);
+                    let _ = std::fs::write(&target, b"INSIDE");
+                }
+            })
+        };
+
+        for attempt in 0..4_000usize {
+            // Path 1: the public API, i.e. openat2 with the resolve flags.
+            if let Ok(bytes) = sandbox.read_bytes(Path::new("race/secret.txt")) {
+                assert_ne!(
+                    bytes, b"OUTSIDE_SECRET",
+                    "openat2 path escaped the root on attempt {attempt}"
+                );
+            }
+            if sandbox
+                .write_bytes(Path::new("race/pwn.txt"), b"BAD")
+                .is_ok()
+            {
+                assert!(
+                    !outside.join("pwn.txt").exists(),
+                    "a write escaped the root on attempt {attempt}"
+                );
+            }
+
+            // Path 2: the dirfd descent, which ENOSYS would select on an old kernel.
+            if let Ok(dir) = std::fs::File::open(&root) {
+                let root_fd = OwnedFd::from(dir);
+                let segs: Vec<&std::ffi::OsStr> = vec!["race".as_ref(), "secret.txt".as_ref()];
+                if let Ok(fd) = PathSandbox::open_read_dirfd_descent(root_fd, &segs) {
+                    use std::io::Read;
+                    let mut f = std::fs::File::from(fd);
+                    let mut buf = Vec::new();
+                    let _ = f.read_to_end(&mut buf);
+                    assert_ne!(
+                        buf, b"OUTSIDE_SECRET",
+                        "dirfd descent escaped the root on attempt {attempt}"
+                    );
+                }
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = flipper.join();
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+}
