@@ -1,11 +1,17 @@
 #![forbid(unsafe_code)]
 
-//! Pure-Rust 3D Cavity & Druggable Binding Pocket Detector (`fpocket` / `LIGSITE` / `CASTp`-style).
+//! Pure-Rust 3D Cavity & Binding Pocket Detector (in-house 14-ray geometric burial model).
 //!
 //! Computes buried solvent-accessible grid cavities on the macromolecular receptor (excluding
-//! waters and ligands so both apo and holo PDB/mmCIF complexes locate true active sites),
-//! clusters 6-connected cavity voxels, scores volume (`Å³`), enclosure, hydrophobic/polar balance,
-//! fpocket-like druggability (`0..1`), lining residues, and ready-to-dock `GridBox` coordinates.
+//! waters and ligands so both apo and holo PDB/mmCIF complexes locate recessed clefts),
+//! clusters 6-connected cavity voxels, and computes volume (`Å³`), directional burial enclosure,
+//! hydrophobic/polar lining residue fractions, a heuristic druggability score (`0..1`), lining
+//! residues, and ready-to-dock `GridBox` coordinates.
+//!
+//! **Provenance note:** This is an in-house geometric burial and heuristic scoring model inspired
+//! by grid-ray cavity detectors; its `druggability_score` is an internal dimensionless index
+//! (`0..1`) and has **not** been calibrated or benchmarked against published `fpocket` or `CASTp`
+//! reference datasets.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 

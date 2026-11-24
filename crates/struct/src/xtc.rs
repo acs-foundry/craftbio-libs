@@ -4,9 +4,13 @@
 //!
 //! Zero C/FFI dependencies, `#![forbid(unsafe_code)]`, hard bounds against hostile inputs:
 //! - Standard big-endian XDR headers (`magic = 1995`, `natoms`, `step`, `time` ps, `3×3 box` nm)
-//! - Uncompressed coordinates (`natoms <= 9`) AND full GROMACS `MAGICINTS` bit-packed
+//! - Uncompressed coordinates (`natoms <= 9`) AND GROMACS `MAGICINTS` bit-packed
 //!   mixed-radix delta compression (`natoms > 9`)
 //! - Automatic `nm <-> Å` (`× 10.0`) conversion into `Biomolecule::frames`
+//!
+//! **Verification scope:** Verified by internal roundtrip tests on both uncompressed (`<= 9`
+//! atoms) and compressed (`> 9` atoms) multi-frame trajectories; cross-validation against
+//! external `gmx trjconv`-generated `.xtc` files has not yet been performed in this repository.
 
 use crate::model::{BioStructError, Biomolecule, MAX_BIOMOL_ATOMS, TrajectoryFrame};
 
