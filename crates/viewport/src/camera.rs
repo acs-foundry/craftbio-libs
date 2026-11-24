@@ -186,12 +186,12 @@ impl Camera3D {
     }
 
     /// Orthographic directional key-light `View * Projection` matrix (`z in [0, 1]`) aligned to
-    /// the camera-space studio key light `l1 = normalize(0.36, 0.56, 0.74)` for 1:1 GPU & headless
-    /// PCF soft shadow maps.
+    /// the camera-space studio key light `l1 = normalize(0.56, 0.62, 0.55)` for 1:1 GPU & headless
+    /// PCF soft shadow maps with crisp sculptural depth.
     #[must_use]
     pub fn light_view_proj_matrix(&self, scene_radius: f32) -> [[f32; 4]; 4] {
         let (right, up, fwd) = self.basis();
-        let l_cam = normalize3([0.36, 0.56, 0.74]);
+        let l_cam = normalize3([0.56, 0.62, 0.55]);
         let light_to_src = normalize3([
             right[0] * l_cam[0] + up[0] * l_cam[1] - fwd[0] * l_cam[2],
             right[1] * l_cam[0] + up[1] * l_cam[1] - fwd[1] * l_cam[2],

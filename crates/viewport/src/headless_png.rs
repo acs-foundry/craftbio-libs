@@ -262,18 +262,18 @@ pub fn render_scene_rgba(
 
     let sample_shadow = |world_pos: [f32; 3], ndotl: f32| -> f32 {
         let Some(ref sz) = shadow_zbuf else {
-            return 1.0;
+            return 0.0;
         };
         let ndc = transform_point_ndc(&light_vp, world_pos);
         let u = ndc[0] * 0.5 + 0.5;
         let v = 0.5 - ndc[1] * 0.5;
         if u <= 0.002 || u >= 0.998 || v <= 0.002 || v >= 0.998 || ndc[2] <= 0.0 || ndc[2] >= 1.0 {
-            return 1.0;
+            return 0.0;
         }
         let dim = SHADOW_DIM as i32;
         let bx = (u * (SHADOW_DIM as f32)) as i32;
         let by = (v * (SHADOW_DIM as f32)) as i32;
-        let bias = 0.0045 + 0.004 * (1.0 - ndotl.clamp(0.0, 1.0));
+        let bias = 0.0022 + 0.0025 * (1.0 - ndotl.clamp(0.0, 1.0));
         let z_cmp = ndc[2] - bias;
         let mut occ = 0.0_f32;
         for dy in -1..=1 {
@@ -286,7 +286,7 @@ pub fn render_scene_rgba(
                 }
             }
         }
-        1.0 - (occ / 9.0) * 0.56 * shadow_str
+        (occ / 9.0) * shadow_str
     };
 
     let project_pt = |p: [f32; 3]| -> Option<(f32, f32, f32, f32)> {
@@ -472,7 +472,7 @@ pub fn render_scene_rgba(
         }
     }
 
-    let light1 = normalize3([0.36, 0.56, 0.74]);
+    let light1 = normalize3([0.56, 0.62, 0.55]);
     let light2 = normalize3([-0.58, -0.22, 0.78]);
     let h1 = normalize3([light1[0], light1[1], light1[2] + 1.0]);
     let bg_rgba: [u8; 4] = if transparent_bg {
@@ -499,16 +499,18 @@ pub fn render_scene_rgba(
         |nx: f32, ny: f32, nz: f32, z: f32, col: [f32; 4], wp: Option<[f32; 3]>| -> [u8; 4] {
             let d1 = (nx * light1[0] + ny * light1[1] + nz * light1[2]).max(0.0);
             let d2 = (nx * light2[0] + ny * light2[1] + nz * light2[2]).max(0.0);
-            let sh = wp.map_or(1.0, |p| sample_shadow(p, d1));
+            let sh_occ = wp.map_or(0.0, |p| sample_shadow(p, d1));
+            let sh_key = 1.0 - 0.85 * sh_occ;
+            let sh_amb = 1.0 - 0.38 * sh_occ;
             let spec = (nx * h1[0] + ny * h1[1] + nz * h1[2])
                 .max(0.0)
                 .powi(shininess)
                 * spec_k
-                * sh;
+                * sh_key;
             let rim = (1.0 - nz).clamp(0.0, 1.0).powi(3) * rim_k;
             let fog =
                 (1.0 - ((z - z_ref * 0.80) / (z_ref * 2.5)).clamp(0.0, 0.36)).clamp(0.64, 1.0);
-            let lit = (amb + diff_k * d1 * sh + fill_k * d2) * fog;
+            let lit = (amb * sh_amb + diff_k * d1 * sh_key + fill_k * d2 * sh_amb) * fog;
             let r = ((col[0] * lit + spec + rim) * 255.0).clamp(0.0, 255.0) as u8;
             let g = ((col[1] * lit + spec + rim) * 255.0).clamp(0.0, 255.0) as u8;
             let b = ((col[2] * lit + spec + rim) * 255.0).clamp(0.0, 255.0) as u8;

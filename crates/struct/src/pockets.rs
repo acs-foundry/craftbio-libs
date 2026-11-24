@@ -128,8 +128,8 @@ pub fn detect_binding_pockets(mol: &Biomolecule, max_pockets: usize) -> Vec<Bind
     let mut grid = vec![0u8; total];
     let idx3 = |x: usize, y: usize, z: usize| -> usize { (z * ny + y) * nx + x };
 
-    let probe_occ = 1.05_f64;
-    let shell_pad = 4.2_f64;
+    let probe_occ = 1.15_f64;
+    let shell_pad = 3.25_f64;
 
     for &ai in &rec_indices {
         let a = &mol.atoms[ai];
@@ -180,10 +180,11 @@ pub fn detect_binding_pockets(mol: &Biomolecule, max_pockets: usize) -> Vec<Bind
         }
     }
 
-    // 14-direction LIGSITE burial raycast on solvent-shell voxels (`grid == 2`)
-    let max_ray_steps = ((12.5 / step).ceil() as i32).clamp(4, 14);
+    // 14-direction LIGSITEcsc burial raycast on solvent-shell voxels (`grid == 2`)
+    let max_ray_steps = ((9.5 / step).ceil() as i32).clamp(4, 11);
     let mut raw_cavity = vec![false; total];
     let mut voxel_enc = vec![0.0_f32; total];
+    let mut voxel_psp = vec![0u8; total];
 
     for z in 1..(nz.saturating_sub(1)) {
         for y in 1..(ny.saturating_sub(1)) {
@@ -218,25 +219,26 @@ pub fn detect_binding_pockets(mol: &Biomolecule, max_pockets: usize) -> Vec<Bind
                         }
                     }
                 }
-                let mut sandwiched_axes = 0u32;
+                let mut sandwiched_axes = 0u8;
                 for pair in 0..7 {
                     if hits[pair * 2] && hits[pair * 2 + 1] {
                         sandwiched_axes += 1;
                     }
                 }
-                if (sandwiched_axes >= 3 && hit_count >= 8)
-                    || (sandwiched_axes >= 2 && hit_count >= 9)
-                    || hit_count >= 11
-                {
+                voxel_enc[id] = (hit_count as f32) / 14.0;
+                voxel_psp[id] = sandwiched_axes;
+                // Strict LIGSITEcsc PSP >= 4 + >= 71% directional burial isolates true deep pockets
+                if (sandwiched_axes >= 4 && hit_count >= 10) || hit_count >= 12 {
                     raw_cavity[id] = true;
-                    voxel_enc[id] = (hit_count as f32) / 14.0;
                 }
             }
         }
     }
 
-    // Strip isolated 1-voxel pinholes (require >= 3 cavity neighbors in 26-neighborhood)
+    // Morphological opening (require >= 6 cavity neighbors in 26-neighborhood) to sever
+    // 1-voxel inter-cleft bridges and strip pinholes so distinct active sites stay crisp
     let mut cavity = vec![false; total];
+    let mut kept_voxels = 0usize;
     for z in 1..(nz.saturating_sub(1)) {
         for y in 1..(ny.saturating_sub(1)) {
             for x in 1..(nx.saturating_sub(1)) {
@@ -261,8 +263,22 @@ pub fn detect_binding_pockets(mol: &Biomolecule, max_pockets: usize) -> Vec<Bind
                         }
                     }
                 }
-                if nbrs >= 3 {
+                if nbrs >= 6 {
                     cavity[id] = true;
+                    kept_voxels += 1;
+                }
+            }
+        }
+    }
+    // Gentle fallback for shallow/open protein-protein clefts if strict PSP>=4 yielded < 8 voxels
+    if kept_voxels < 8 {
+        for z in 1..(nz.saturating_sub(1)) {
+            for y in 1..(ny.saturating_sub(1)) {
+                for x in 1..(nx.saturating_sub(1)) {
+                    let id = idx3(x, y, z);
+                    if voxel_psp[id] >= 3 && voxel_enc[id] >= 0.64 {
+                        cavity[id] = true;
+                    }
                 }
             }
         }

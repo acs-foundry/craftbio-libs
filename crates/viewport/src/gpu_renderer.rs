@@ -210,17 +210,17 @@ struct VsOut {
 fn sample_shadow_pcf(world_pos: vec3<f32>, ndotl: f32) -> f32 {
     let str = clamp(u.shadow_params.x, 0.0, 1.0);
     if (str <= 0.01) {
-        return 1.0;
+        return 0.0;
     }
     let lp = u.light_view_proj * vec4<f32>(world_pos, 1.0);
     let ndc = lp.xyz / max(lp.w, 1e-5);
     let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
     if (uv.x <= 0.002 || uv.x >= 0.998 || uv.y <= 0.002 || uv.y >= 0.998 || ndc.z <= 0.0 || ndc.z >= 1.0) {
-        return 1.0;
+        return 0.0;
     }
     let dims = vec2<i32>(textureDimensions(shadow_tex));
     let base_xy = vec2<i32>(uv * vec2<f32>(dims));
-    let bias = u.shadow_params.y + 0.004 * (1.0 - clamp(ndotl, 0.0, 1.0));
+    let bias = u.shadow_params.y + 0.0025 * (1.0 - clamp(ndotl, 0.0, 1.0));
     var occ = 0.0;
     for (var dy = -1; dy <= 1; dy = dy + 1) {
         for (var dx = -1; dx <= 1; dx = dx + 1) {
@@ -231,7 +231,7 @@ fn sample_shadow_pcf(world_pos: vec3<f32>, ndotl: f32) -> f32 {
             }
         }
     }
-    return 1.0 - (occ / 9.0) * 0.56 * str;
+    return (occ / 9.0) * str;
 }
 
 @vertex
@@ -263,7 +263,7 @@ fn fs_main(in: VsOut, @builtin(front_facing) is_front: bool) -> @location(0) vec
         dot(wn, u.cam_up.xyz),
         max(-dot(wn, u.cam_fwd.xyz), 0.02)
     ));
-    let l1 = normalize(vec3<f32>(0.36, 0.56, 0.74));
+    let l1 = normalize(vec3<f32>(0.56, 0.62, 0.55));
     let l2 = normalize(vec3<f32>(-0.58, -0.22, 0.78));
     let d1 = max(dot(n, l1), 0.0);
     let d2 = max(dot(n, l2), 0.0);
@@ -285,12 +285,14 @@ fn fs_main(in: VsOut, @builtin(front_facing) is_front: bool) -> @location(0) vec
         amb = 0.34; diff_k = 0.62; fill_k = 0.22; spec_k = 0.18; shininess = 24.0;
     }
 
-    let sh = select(1.0, sample_shadow_pcf(in.world_pos, d1), in.color.a >= 0.95);
-    let spec = pow(max(dot(n, h1), 0.0), shininess) * spec_k * sh;
+    let sh_occ = select(0.0, sample_shadow_pcf(in.world_pos, d1), in.color.a >= 0.95);
+    let sh_key = 1.0 - 0.85 * sh_occ;
+    let sh_amb = 1.0 - 0.38 * sh_occ;
+    let spec = pow(max(dot(n, h1), 0.0), shininess) * spec_k * sh_key;
     let rim = pow(clamp(1.0 - n.z, 0.0, 1.0), 3.0) * select(0.08, 0.22, preset >= 2.5 && preset < 3.5);
     let z_ref = max(u.clip_params.z, 10.0);
     let fog = clamp(1.0 - clamp((in.view_z - z_ref * 0.80) / (z_ref * 2.5), 0.0, 0.36), 0.64, 1.0);
-    let lit = (amb + diff_k * d1 * sh + fill_k * d2) * fog;
+    let lit = (amb * sh_amb + diff_k * d1 * sh_key + fill_k * d2 * sh_amb) * fog;
     let rgb = clamp(in.color.rgb * lit + vec3<f32>(spec + rim), vec3<f32>(0.0), vec3<f32>(1.0));
     return vec4<f32>(rgb, in.color.a);
 }
@@ -327,17 +329,17 @@ struct FsOut {
 fn sample_shadow_pcf(world_pos: vec3<f32>, ndotl: f32) -> f32 {
     let str = clamp(u.shadow_params.x, 0.0, 1.0);
     if (str <= 0.01) {
-        return 1.0;
+        return 0.0;
     }
     let lp = u.light_view_proj * vec4<f32>(world_pos, 1.0);
     let ndc = lp.xyz / max(lp.w, 1e-5);
     let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
     if (uv.x <= 0.002 || uv.x >= 0.998 || uv.y <= 0.002 || uv.y >= 0.998 || ndc.z <= 0.0 || ndc.z >= 1.0) {
-        return 1.0;
+        return 0.0;
     }
     let dims = vec2<i32>(textureDimensions(shadow_tex));
     let base_xy = vec2<i32>(uv * vec2<f32>(dims));
-    let bias = u.shadow_params.y + 0.004 * (1.0 - clamp(ndotl, 0.0, 1.0));
+    let bias = u.shadow_params.y + 0.0025 * (1.0 - clamp(ndotl, 0.0, 1.0));
     var occ = 0.0;
     for (var dy = -1; dy <= 1; dy = dy + 1) {
         for (var dx = -1; dx <= 1; dx = dx + 1) {
@@ -348,7 +350,7 @@ fn sample_shadow_pcf(world_pos: vec3<f32>, ndotl: f32) -> f32 {
             }
         }
     }
-    return 1.0 - (occ / 9.0) * 0.56 * str;
+    return (occ / 9.0) * str;
 }
 
 @vertex
@@ -394,16 +396,18 @@ fn fs_main(in: VsOut) -> FsOut {
     let proj = u.view_proj * vec4<f32>(hit_world, 1.0);
     let frag_z = clamp(proj.z / max(proj.w, 1e-5), 0.0, 1.0);
 
-    let l1 = normalize(vec3<f32>(0.36, 0.56, 0.74));
+    let l1 = normalize(vec3<f32>(0.56, 0.62, 0.55));
     let l2 = normalize(vec3<f32>(-0.58, -0.22, 0.78));
     let d1 = max(dot(n, l1), 0.0);
     let d2 = max(dot(n, l2), 0.0);
     let h1 = normalize(l1 + vec3<f32>(0.0, 0.0, 1.0));
-    let sh = select(1.0, sample_shadow_pcf(hit_world, d1), in.color.a >= 0.95);
-    let spec = pow(max(dot(n, h1), 0.0), 30.0) * 0.30 * sh;
+    let sh_occ = select(0.0, sample_shadow_pcf(hit_world, d1), in.color.a >= 0.95);
+    let sh_key = 1.0 - 0.85 * sh_occ;
+    let sh_amb = 1.0 - 0.38 * sh_occ;
+    let spec = pow(max(dot(n, h1), 0.0), 30.0) * 0.30 * sh_key;
     let z_ref = max(u.clip_params.z, 10.0);
     let fog = clamp(1.0 - clamp((view_z - z_ref * 0.80) / (z_ref * 2.5), 0.0, 0.36), 0.64, 1.0);
-    let lit = (0.26 + 0.66 * d1 * sh + 0.20 * d2) * fog;
+    let lit = (0.26 * sh_amb + 0.66 * d1 * sh_key + 0.20 * d2 * sh_amb) * fog;
     let rgb = clamp(in.color.rgb * lit + vec3<f32>(spec), vec3<f32>(0.0), vec3<f32>(1.0));
     var out: FsOut;
     out.color = vec4<f32>(rgb, in.color.a);
@@ -444,17 +448,17 @@ struct FsOut {
 fn sample_shadow_pcf(world_pos: vec3<f32>, ndotl: f32) -> f32 {
     let str = clamp(u.shadow_params.x, 0.0, 1.0);
     if (str <= 0.01) {
-        return 1.0;
+        return 0.0;
     }
     let lp = u.light_view_proj * vec4<f32>(world_pos, 1.0);
     let ndc = lp.xyz / max(lp.w, 1e-5);
     let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
     if (uv.x <= 0.002 || uv.x >= 0.998 || uv.y <= 0.002 || uv.y >= 0.998 || ndc.z <= 0.0 || ndc.z >= 1.0) {
-        return 1.0;
+        return 0.0;
     }
     let dims = vec2<i32>(textureDimensions(shadow_tex));
     let base_xy = vec2<i32>(uv * vec2<f32>(dims));
-    let bias = u.shadow_params.y + 0.004 * (1.0 - clamp(ndotl, 0.0, 1.0));
+    let bias = u.shadow_params.y + 0.0025 * (1.0 - clamp(ndotl, 0.0, 1.0));
     var occ = 0.0;
     for (var dy = -1; dy <= 1; dy = dy + 1) {
         for (var dx = -1; dx <= 1; dx = dx + 1) {
@@ -465,7 +469,7 @@ fn sample_shadow_pcf(world_pos: vec3<f32>, ndotl: f32) -> f32 {
             }
         }
     }
-    return 1.0 - (occ / 9.0) * 0.56 * str;
+    return (occ / 9.0) * str;
 }
 
 @vertex
@@ -525,14 +529,16 @@ fn fs_main(in: VsOut) -> FsOut {
     let frag_z = clamp(proj.z / max(proj.w, 1e-5), 0.0, 1.0);
 
     let n = vec3<f32>(0.0, y, nz);
-    let l1 = normalize(vec3<f32>(0.36, 0.56, 0.74));
+    let l1 = normalize(vec3<f32>(0.56, 0.62, 0.55));
     let l2 = normalize(vec3<f32>(-0.58, -0.22, 0.78));
     let d1 = max(dot(n, l1), 0.0);
     let d2 = max(dot(n, l2), 0.0);
-    let sh = sample_shadow_pcf(hit_world, d1);
+    let sh_occ = sample_shadow_pcf(hit_world, d1);
+    let sh_key = 1.0 - 0.85 * sh_occ;
+    let sh_amb = 1.0 - 0.38 * sh_occ;
     let z_ref = max(u.clip_params.z, 10.0);
     let fog = clamp(1.0 - clamp((view_z - z_ref * 0.80) / (z_ref * 2.5), 0.0, 0.36), 0.64, 1.0);
-    let lit = (0.28 + 0.62 * d1 * sh + 0.20 * d2) * fog;
+    let lit = (0.28 * sh_amb + 0.62 * d1 * sh_key + 0.20 * d2 * sh_amb) * fog;
     var out: FsOut;
     out.color = vec4<f32>(clamp(in.color.rgb * lit, vec3<f32>(0.0), vec3<f32>(1.0)), in.color.a);
     out.depth = frag_z;
@@ -930,7 +936,7 @@ impl CallbackTrait for BiomolPaintCallback {
                 self.px_size[0] as f32,
                 self.px_size[1] as f32,
             ],
-            shadow_params: [shadow_str, 0.0045, SHADOW_MAP_SIZE as f32, 0.0],
+            shadow_params: [shadow_str, 0.0022, SHADOW_MAP_SIZE as f32, 0.0],
         };
         queue.write_buffer(&gpu.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 
