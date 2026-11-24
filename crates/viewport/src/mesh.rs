@@ -14,8 +14,8 @@ use std::fmt::Write as _;
 
 use bytemuck::{Pod, Zeroable};
 use craftbio_struct::{
-    Biomolecule, ResidueClass, SecondaryStructure, SnfgShape, VolumeGrid3D, detect_snfg_glycans,
-    vdw_radius,
+    BindingPocket3D, Biomolecule, ResidueClass, SecondaryStructure, SnfgShape, VolumeGrid3D,
+    detect_snfg_glycans, vdw_radius,
 };
 use rayon::prelude::*;
 use serde_json::json;
@@ -1659,4 +1659,116 @@ pub fn build_orthoplanes_mesh(grid: &VolumeGrid3D, frac: [f32; 3], alpha: f32) -
     }
 
     mesh
+}
+
+/// Build smooth translucent Marching-Tetrahedra 3D cavity meshes for detected binding pockets.
+///
+/// The active/selected pocket (or Pocket #1 by default) is rendered in luminous emerald-teal;
+/// secondary cavities use distinct gold/cyan/violet hues.
+#[must_use]
+pub fn build_pockets_mesh(
+    pockets: &[BindingPocket3D],
+    selected_pocket_id: Option<usize>,
+) -> TriangleMesh {
+    let mut combined = TriangleMesh {
+        vertices: Vec::new(),
+        indices: Vec::new(),
+        is_transparent: true,
+        wireframe: false,
+    };
+    const POCKET_PALETTE: &[[f32; 3]] = &[
+        [0.14, 0.88, 0.58], // Pocket #1 / selected emerald
+        [0.98, 0.74, 0.18], // Pocket #2 warm gold
+        [0.24, 0.78, 0.98], // Pocket #3 sky cyan
+        [0.74, 0.50, 0.98], // Pocket #4 soft violet
+        [0.96, 0.46, 0.62], // Pocket #5 coral rose
+    ];
+
+    let active_id = selected_pocket_id.or_else(|| pockets.first().map(|p| p.pocket_id));
+
+    for (idx, p) in pockets.iter().enumerate() {
+        if p.cavity_voxels.is_empty() {
+            continue;
+        }
+        let mut lo = [f32::INFINITY; 3];
+        let mut hi = [f32::NEG_INFINITY; 3];
+        for v in &p.cavity_voxels {
+            for k in 0..3 {
+                lo[k] = lo[k].min(v[k]);
+                hi[k] = hi[k].max(v[k]);
+            }
+        }
+        let step = p.voxel_step_a.clamp(0.95, 2.0);
+        let pad = step * 2.5;
+        for k in 0..3 {
+            lo[k] -= pad;
+            hi[k] += pad;
+        }
+        let gstep = (step * 0.88).clamp(0.85, 1.85);
+        let nx = (((hi[0] - lo[0]) / gstep).ceil() as usize + 1).clamp(6, 48);
+        let ny = (((hi[1] - lo[1]) / gstep).ceil() as usize + 1).clamp(6, 48);
+        let nz = (((hi[2] - lo[2]) / gstep).ceil() as usize + 1).clamp(6, 48);
+        let mut values = vec![0.0_f32; nx * ny * nz];
+        let sigma = step * 0.95;
+        let inv_2s2 = 1.0 / (2.0 * sigma * sigma);
+        let cut = sigma * 2.3;
+        let cut2 = cut * cut;
+
+        for v in &p.cavity_voxels {
+            let x0 = (((v[0] - cut - lo[0]) / gstep).floor() as isize).clamp(0, nx as isize - 1)
+                as usize;
+            let x1 =
+                (((v[0] + cut - lo[0]) / gstep).ceil() as isize).clamp(0, nx as isize - 1) as usize;
+            let y0 = (((v[1] - cut - lo[1]) / gstep).floor() as isize).clamp(0, ny as isize - 1)
+                as usize;
+            let y1 =
+                (((v[1] + cut - lo[1]) / gstep).ceil() as isize).clamp(0, ny as isize - 1) as usize;
+            let z0 = (((v[2] - cut - lo[2]) / gstep).floor() as isize).clamp(0, nz as isize - 1)
+                as usize;
+            let z1 =
+                (((v[2] + cut - lo[2]) / gstep).ceil() as isize).clamp(0, nz as isize - 1) as usize;
+            for gz in z0..=z1 {
+                let dz = (lo[2] + (gz as f32) * gstep) - v[2];
+                let dz2 = dz * dz;
+                for gy in y0..=y1 {
+                    let dy = (lo[1] + (gy as f32) * gstep) - v[1];
+                    let dyz2 = dz2 + dy * dy;
+                    if dyz2 > cut2 {
+                        continue;
+                    }
+                    let row = (gz * ny + gy) * nx;
+                    for gx in x0..=x1 {
+                        let dx = (lo[0] + (gx as f32) * gstep) - v[0];
+                        let d2 = dyz2 + dx * dx;
+                        if d2 <= cut2 {
+                            values[row + gx] += (-d2 * inv_2s2).exp();
+                        }
+                    }
+                }
+            }
+        }
+
+        let grid = VolumeGrid3D {
+            label: format!("pocket_{}", p.pocket_id),
+            dims: [nx, ny, nz],
+            origin: [f64::from(lo[0]), f64::from(lo[1]), f64::from(lo[2])],
+            voxel_size: [f64::from(gstep), f64::from(gstep), f64::from(gstep)],
+            values,
+            min_val: 0.0,
+            max_val: 1.0,
+            mean: 0.0,
+            std_dev: 1.0,
+        };
+        let is_selected = active_id == Some(p.pocket_id);
+        let rgb = if is_selected {
+            POCKET_PALETTE[0]
+        } else {
+            POCKET_PALETTE[(idx + 1).min(POCKET_PALETTE.len() - 1)]
+        };
+        let alpha = if is_selected { 0.50 } else { 0.34 };
+        let sub = extract_isosurface_mesh(&grid, 0.62, |_| rgb, alpha, false, 1);
+        combined.extend_from(&sub);
+    }
+
+    combined
 }

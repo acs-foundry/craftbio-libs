@@ -184,6 +184,98 @@ impl Camera3D {
         }
         best.map(|(i, _)| i)
     }
+
+    /// Orthographic directional key-light `View * Projection` matrix (`z in [0, 1]`) aligned to
+    /// the camera-space studio key light `l1 = normalize(0.36, 0.56, 0.74)` for 1:1 GPU & headless
+    /// PCF soft shadow maps.
+    #[must_use]
+    pub fn light_view_proj_matrix(&self, scene_radius: f32) -> [[f32; 4]; 4] {
+        let (right, up, fwd) = self.basis();
+        let l_cam = normalize3([0.36, 0.56, 0.74]);
+        let light_to_src = normalize3([
+            right[0] * l_cam[0] + up[0] * l_cam[1] - fwd[0] * l_cam[2],
+            right[1] * l_cam[0] + up[1] * l_cam[1] - fwd[1] * l_cam[2],
+            right[2] * l_cam[0] + up[2] * l_cam[1] - fwd[2] * l_cam[2],
+        ]);
+        let light_fwd = [-light_to_src[0], -light_to_src[1], -light_to_src[2]];
+        let ref_up = if light_fwd[1].abs() < 0.92 {
+            [0.0_f32, 1.0, 0.0]
+        } else {
+            [1.0_f32, 0.0, 0.0]
+        };
+        let l_right = normalize3(cross3(light_fwd, ref_up));
+        let l_up = normalize3(cross3(l_right, light_fwd));
+
+        let r = scene_radius.clamp(12.0, 260.0);
+        let l_eye = [
+            self.target[0] + light_to_src[0] * (2.2 * r),
+            self.target[1] + light_to_src[1] * (2.2 * r),
+            self.target[2] + light_to_src[2] * (2.2 * r),
+        ];
+        let view = [
+            [l_right[0], l_up[0], -light_fwd[0], 0.0],
+            [l_right[1], l_up[1], -light_fwd[1], 0.0],
+            [l_right[2], l_up[2], -light_fwd[2], 0.0],
+            [
+                -dot3(l_right, l_eye),
+                -dot3(l_up, l_eye),
+                dot3(light_fwd, l_eye),
+                1.0,
+            ],
+        ];
+        let near = 0.2 * r;
+        let far = 4.4 * r;
+        let proj = [
+            [1.0 / r, 0.0, 0.0, 0.0],
+            [0.0, 1.0 / r, 0.0, 0.0],
+            [0.0, 0.0, -1.0 / (far - near), 0.0],
+            [0.0, 0.0, -near / (far - near), 1.0],
+        ];
+        mat4_mul(proj, view)
+    }
+
+    /// Unproject a 2D viewport pixel drag delta `(dx_px, dy_px)` into a 3D world-space
+    /// screen-plane displacement (`Å`) anchored at `world_pt` (for live mouse `Drag-to-Sculpt`).
+    #[must_use]
+    pub fn unproject_screen_delta_at_point(
+        &self,
+        world_pt: [f64; 3],
+        dx_px: f32,
+        dy_px: f32,
+        viewport_h: f32,
+    ) -> [f64; 3] {
+        let eye = self.eye();
+        let (right, up, fwd) = self.basis();
+        let depth = if self.orthographic {
+            self.distance.max(1.0)
+        } else {
+            let rel = [
+                world_pt[0] as f32 - eye[0],
+                world_pt[1] as f32 - eye[1],
+                world_pt[2] as f32 - eye[2],
+            ];
+            dot3(rel, fwd).max(1.5)
+        };
+        let world_h = 2.0 * depth * (0.5 * self.fov_y_rad).tan();
+        let a_per_px = f64::from(world_h / viewport_h.max(1.0));
+        let sx = f64::from(dx_px) * a_per_px;
+        let sy = -f64::from(dy_px) * a_per_px;
+        [
+            f64::from(right[0]) * sx + f64::from(up[0]) * sy,
+            f64::from(right[1]) * sx + f64::from(up[1]) * sy,
+            f64::from(right[2]) * sx + f64::from(up[2]) * sy,
+        ]
+    }
+}
+
+/// Transform a 3D world point by a column-major 4×4 matrix into clip/NDC `(x, y, z)`.
+#[must_use]
+pub fn transform_point_ndc(mat: &[[f32; 4]; 4], p: [f32; 3]) -> [f32; 3] {
+    let x = mat[0][0] * p[0] + mat[1][0] * p[1] + mat[2][0] * p[2] + mat[3][0];
+    let y = mat[0][1] * p[0] + mat[1][1] * p[1] + mat[2][1] * p[2] + mat[3][1];
+    let z = mat[0][2] * p[0] + mat[1][2] * p[1] + mat[2][2] * p[2] + mat[3][2];
+    let w = (mat[0][3] * p[0] + mat[1][3] * p[1] + mat[2][3] * p[2] + mat[3][3]).max(1e-5);
+    [x / w, y / w, z / w]
 }
 
 #[must_use]

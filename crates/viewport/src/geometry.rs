@@ -13,12 +13,13 @@ use craftbio_scene::{
     RepresentationKind, ScaleBarSpec, SphereOverlay,
 };
 use craftbio_struct::{
-    Biomolecule, ResidueClass, SecondaryStructure, UnitCell, VolumeGrid3D, compute_esp_at_points,
-    compute_per_atom_mlp, compute_per_atom_sap, cpk_color, dist3, nucleotide_color, vdw_radius,
+    BindingPocket3D, Biomolecule, ResidueClass, SecondaryStructure, UnitCell, VolumeGrid3D,
+    compute_esp_at_points, compute_per_atom_mlp, compute_per_atom_sap, cpk_color, dist3,
+    nucleotide_color, vdw_radius,
 };
 
 use crate::mesh::{
-    TriangleMesh, build_cartoon_mesh, build_orthoplanes_mesh, build_putty_mesh,
+    TriangleMesh, build_cartoon_mesh, build_orthoplanes_mesh, build_pockets_mesh, build_putty_mesh,
     build_ses_surface_mesh, build_snfg_glycans_mesh, export_meshes_to_glb, export_meshes_to_obj,
     extract_isosurface_mesh,
 };
@@ -53,6 +54,8 @@ pub struct RenderSceneData {
     pub background: [f32; 4],
     pub lighting: LightingPreset,
     pub ssao_strength: f32,
+    /// Directional PCF 3×3 soft shadow map intensity (`0.0 = off`, `0.55 = default`, `1.0 = deep`).
+    pub shadow_strength: f32,
     pub show_silhouettes: bool,
     pub labels_3d: Vec<Label3D>,
     pub labels_2d: Vec<Label2D>,
@@ -70,6 +73,7 @@ impl Default for RenderSceneData {
             background: [0.06, 0.08, 0.12, 1.0],
             lighting: LightingPreset::Soft,
             ssao_strength: 0.55,
+            shadow_strength: 0.55,
             show_silhouettes: true,
             labels_3d: Vec::new(),
             labels_2d: Vec::new(),
@@ -80,6 +84,41 @@ impl Default for RenderSceneData {
 }
 
 impl RenderSceneData {
+    /// Compute bounding radius of opaque geometry around `center` for tight shadow-map framing.
+    #[must_use]
+    pub fn shadow_radius_around(&self, center: [f32; 3], fallback: f32) -> f32 {
+        let mut max_r2 = 0.0_f32;
+        for m in &self.opaque_meshes {
+            for v in &m.vertices {
+                let dx = v.position[0] - center[0];
+                let dy = v.position[1] - center[1];
+                let dz = v.position[2] - center[2];
+                max_r2 = max_r2.max(dx * dx + dy * dy + dz * dz);
+            }
+        }
+        for sp in &self.spheres {
+            if sp.color[3] >= 0.95 {
+                let dx = sp.center[0] - center[0];
+                let dy = sp.center[1] - center[1];
+                let dz = sp.center[2] - center[2];
+                let d = (dx * dx + dy * dy + dz * dz).sqrt() + sp.radius;
+                max_r2 = max_r2.max(d * d);
+            }
+        }
+        for cap in &self.capsules {
+            for p in [cap.a, cap.b] {
+                let dx = p[0] - center[0];
+                let dy = p[1] - center[1];
+                let dz = p[2] - center[2];
+                max_r2 = max_r2.max(dx * dx + dy * dy + dz * dz);
+            }
+        }
+        if max_r2 > 4.0 {
+            (max_r2.sqrt() * 1.08).clamp(12.0, 240.0)
+        } else {
+            fallback.clamp(12.0, 240.0)
+        }
+    }
     /// Merge another model's rendered geometry cleanly into this multi-model scene.
     pub fn merge_from(&mut self, mut other: Self) {
         self.opaque_meshes.append(&mut other.opaque_meshes);
@@ -138,6 +177,8 @@ pub struct RenderOptions {
     pub show_silhouettes: bool,
     pub lighting: LightingPreset,
     pub ssao_strength: f32,
+    /// Directional PCF 3×3 soft shadow map intensity (`0.0..=1.0`, default `0.55`).
+    pub shadow_strength: f32,
     pub background: [f32; 4],
     /// Optional per-residue custom highlight colors `(chain, res_seq) -> [r, g, b]` (e.g. IMGT CDRs, catalytic triads, RNA motifs).
     pub residue_highlights: HashMap<(char, i32), [f32; 3]>,
@@ -146,6 +187,9 @@ pub struct RenderOptions {
     pub selected_atoms: Vec<bool>,
     /// Optional docking `GridBox3D` wireframe overlay.
     pub grid_box: Option<GridBox3D>,
+    /// Optional detected 3D binding pockets rendered as translucent Marching-Tetrahedra cavity shells.
+    pub binding_pockets: Vec<BindingPocket3D>,
+    pub selected_pocket_id: Option<usize>,
     /// Optional volumetric Cryo-EM / APBS map rendered as a true Marching-Tetrahedra isosurface.
     pub volume_grid: Option<VolumeGrid3D>,
     pub volume_sigma: f64,
@@ -178,12 +222,15 @@ impl Default for RenderOptions {
             show_silhouettes: true,
             lighting: LightingPreset::Soft,
             ssao_strength: 0.55,
+            shadow_strength: 0.55,
             background: [0.06, 0.08, 0.12, 1.0],
             residue_highlights: HashMap::new(),
             sphere_overlays: Vec::new(),
             line_overlays: Vec::new(),
             selected_atoms: Vec::new(),
             grid_box: None,
+            binding_pockets: Vec::new(),
+            selected_pocket_id: None,
             volume_grid: None,
             volume_sigma: 1.5,
             volume_wireframe: false,
@@ -361,6 +408,7 @@ pub fn build_render_scene(mol: &Biomolecule, opts: &RenderOptions) -> RenderScen
         background: opts.background,
         lighting: opts.lighting,
         ssao_strength: opts.ssao_strength,
+        shadow_strength: opts.shadow_strength,
         show_silhouettes: opts.show_silhouettes,
         labels_3d: opts.labels_3d.clone(),
         labels_2d: opts.labels_2d.clone(),
@@ -721,9 +769,15 @@ pub fn build_render_scene(mol: &Biomolecule, opts: &RenderOptions) -> RenderScen
         }
     }
 
-    // 7. Optional 3D GridBox Wireframe
+    // 7. Optional 3D GridBox Wireframe & Detected Binding Pocket Cavity Meshes
     if let Some(ref gb) = opts.grid_box {
         push_grid_box_wireframe(&mut scene, gb, [0.98, 0.82, 0.22, 0.95]);
+    }
+    if !opts.binding_pockets.is_empty() {
+        let pocket_mesh = build_pockets_mesh(&opts.binding_pockets, opts.selected_pocket_id);
+        if !pocket_mesh.indices.is_empty() {
+            scene.transparent_meshes.push(pocket_mesh);
+        }
     }
 
     // 8. Module Overlays (Ala-Scan hotspots, HYDE coronas, ΔMIF, pharmacophores, H-bonds)

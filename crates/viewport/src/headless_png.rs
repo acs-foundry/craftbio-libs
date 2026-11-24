@@ -2,7 +2,8 @@
 
 //! Deterministic Headless Publication PNG Renderer (1:1 Parity with GPU `wgpu 24` Viewport):
 //! - Smooth Indexed Triangle Meshes (Cartoon Ribbons, β-Sheet Arrowheads, RNA Base Slabs,
-//!   Marching-Tetrahedra SES Molecular Surfaces & Cryo-EM Isosurfaces + Wireframe `isomesh`)
+//!   Marching-Tetrahedra SES Molecular Surfaces, 3D Binding Pockets & Cryo-EM Isosurfaces)
+//! - Directional `768×768` **3×3 PCF Soft Shadow Maps** aligned to the key studio light
 //! - Analytical Ray-Cast Spheres & Capsules with Exact Near/Far Clip Planes
 //! - Full-Frame Z-Buffer **SSAO (12-tap Poisson Ambient Occlusion)** & ChimeraX **Depth Silhouettes**
 //! - Up to 4K `3840×2160`, 100% deterministic, zero GPU window required.
@@ -13,9 +14,11 @@ use craftbio_scene::LightingPreset;
 use rayon::prelude::*;
 use thiserror::Error;
 
-use crate::camera::{Camera3D, dot3, normalize3};
+use crate::camera::{Camera3D, dot3, normalize3, transform_point_ndc};
 use crate::geometry::RenderSceneData;
 use crate::mesh::TriangleMesh;
+
+const SHADOW_DIM: usize = 768;
 
 #[derive(Debug, Error)]
 pub enum RenderError {
@@ -31,6 +34,7 @@ struct ProjTri {
     x: [f32; 3],
     y: [f32; 3],
     z: [f32; 3],
+    wp: [[f32; 3]; 3],
     /// Camera-space normals `(nx, ny, nz)` per vertex
     n: [[f32; 3]; 3],
     col: [[f32; 4]; 3],
@@ -47,6 +51,7 @@ struct ProjSphere {
     z: f32,
     r_px: f32,
     r_a: f32,
+    center_world: [f32; 3],
     color: [f32; 4],
 }
 
@@ -57,6 +62,8 @@ struct ProjCapsule {
     bx: f32,
     by: f32,
     bz: f32,
+    a_world: [f32; 3],
+    b_world: [f32; 3],
     r_px: f32,
     r_a: f32,
     dashed: bool,
@@ -77,8 +84,155 @@ struct ProjLine {
     max_y: i32,
 }
 
+/// Build an orthographic `SHADOW_DIM × SHADOW_DIM` depth buffer (`z in [0, 1]`) from the key studio
+/// light across all opaque meshes, opaque spheres, and capsules for 1:1 GPU/headless PCF shadows.
+fn build_shadow_depth_map(scene: &RenderSceneData, light_vp: &[[f32; 4]; 4]) -> Vec<f32> {
+    let dim = SHADOW_DIM;
+    let dim_f = dim as f32;
+    let mut zbuf = vec![1.0_f32; dim * dim];
+
+    let to_spx = |p: [f32; 3]| -> (f32, f32, f32) {
+        let ndc = transform_point_ndc(light_vp, p);
+        (
+            (ndc[0] * 0.5 + 0.5) * dim_f,
+            (0.5 - ndc[1] * 0.5) * dim_f,
+            ndc[2],
+        )
+    };
+
+    // 1. Opaque meshes
+    for mesh in &scene.opaque_meshes {
+        let pv: Vec<(f32, f32, f32)> = mesh.vertices.iter().map(|v| to_spx(v.position)).collect();
+        for tri in mesh.indices.as_chunks::<3>().0 {
+            let (Some(&a), Some(&b), Some(&c)) = (
+                pv.get(tri[0] as usize),
+                pv.get(tri[1] as usize),
+                pv.get(tri[2] as usize),
+            ) else {
+                continue;
+            };
+            let area = (b.0 - a.0) * (c.1 - a.1) - (c.0 - a.0) * (b.1 - a.1);
+            if area.abs() < 0.05 {
+                continue;
+            }
+            let inv_area = 1.0 / area;
+            let x0 = a.0.min(b.0).min(c.0).floor().clamp(0.0, dim_f - 1.0) as usize;
+            let x1 = a.0.max(b.0).max(c.0).ceil().clamp(0.0, dim_f - 1.0) as usize;
+            let y0 = a.1.min(b.1).min(c.1).floor().clamp(0.0, dim_f - 1.0) as usize;
+            let y1 = a.1.max(b.1).max(c.1).ceil().clamp(0.0, dim_f - 1.0) as usize;
+            for py in y0..=y1 {
+                let fy = py as f32 + 0.5;
+                let row = py * dim;
+                for px in x0..=x1 {
+                    let fx = px as f32 + 0.5;
+                    let w0 = ((b.0 - fx) * (c.1 - fy) - (c.0 - fx) * (b.1 - fy)) * inv_area;
+                    if w0 < -1e-4 {
+                        continue;
+                    }
+                    let w1 = ((c.0 - fx) * (a.1 - fy) - (a.0 - fx) * (c.1 - fy)) * inv_area;
+                    if w1 < -1e-4 {
+                        continue;
+                    }
+                    let w2 = 1.0 - w0 - w1;
+                    if w2 < -1e-4 {
+                        continue;
+                    }
+                    let z = w0 * a.2 + w1 * b.2 + w2 * c.2;
+                    if z >= 0.0 && z < zbuf[row + px] {
+                        zbuf[row + px] = z;
+                    }
+                }
+            }
+        }
+    }
+
+    // Light orthographic scales per Ångström (column-major matrix rows 0, 1, 2)
+    let scale_x = (light_vp[0][0] * light_vp[0][0]
+        + light_vp[1][0] * light_vp[1][0]
+        + light_vp[2][0] * light_vp[2][0])
+        .sqrt();
+    let scale_z = (light_vp[0][2] * light_vp[0][2]
+        + light_vp[1][2] * light_vp[1][2]
+        + light_vp[2][2] * light_vp[2][2])
+        .sqrt();
+    let px_per_a = 0.5 * dim_f * scale_x;
+
+    // 2. Opaque spheres
+    for sp in &scene.spheres {
+        if sp.color[3] < 0.95 {
+            continue;
+        }
+        let (sx, sy, sz) = to_spx(sp.center);
+        let r_px = (sp.radius * px_per_a).max(1.0);
+        let r_z = sp.radius * scale_z;
+        let x0 = (sx - r_px).floor().clamp(0.0, dim_f - 1.0) as usize;
+        let x1 = (sx + r_px).ceil().clamp(0.0, dim_f - 1.0) as usize;
+        let y0 = (sy - r_px).floor().clamp(0.0, dim_f - 1.0) as usize;
+        let y1 = (sy + r_px).ceil().clamp(0.0, dim_f - 1.0) as usize;
+        let rad2 = r_px * r_px;
+        for py in y0..=y1 {
+            let dy = (py as f32 + 0.5) - sy;
+            let dy2 = dy * dy;
+            let row = py * dim;
+            for px in x0..=x1 {
+                let dx = (px as f32 + 0.5) - sx;
+                let d2 = dx * dx + dy2;
+                if d2 > rad2 {
+                    continue;
+                }
+                let nz = (1.0 - d2 / rad2).max(0.0).sqrt();
+                let z = (sz - nz * r_z).clamp(0.0, 1.0);
+                if z < zbuf[row + px] {
+                    zbuf[row + px] = z;
+                }
+            }
+        }
+    }
+
+    // 3. Solid opaque capsules (bonds / stems)
+    for cap in &scene.capsules {
+        if cap.dashed > 0.5 || cap.color[3] < 0.95 {
+            continue;
+        }
+        let (ax, ay, az) = to_spx(cap.a);
+        let (bx, by, bz) = to_spx(cap.b);
+        let r_px = (cap.radius * px_per_a).max(0.8);
+        let r_z = cap.radius * scale_z;
+        let x0 = (ax.min(bx) - r_px).floor().clamp(0.0, dim_f - 1.0) as usize;
+        let x1 = (ax.max(bx) + r_px).ceil().clamp(0.0, dim_f - 1.0) as usize;
+        let y0 = (ay.min(by) - r_px).floor().clamp(0.0, dim_f - 1.0) as usize;
+        let y1 = (ay.max(by) + r_px).ceil().clamp(0.0, dim_f - 1.0) as usize;
+        let abx = bx - ax;
+        let aby = by - ay;
+        let ab_len2 = (abx * abx + aby * aby).max(1e-5);
+        let rad2 = r_px * r_px;
+        for py in y0..=y1 {
+            let fy = py as f32 + 0.5;
+            let row = py * dim;
+            for px in x0..=x1 {
+                let fx = px as f32 + 0.5;
+                let t = (((fx - ax) * abx + (fy - ay) * aby) / ab_len2).clamp(0.0, 1.0);
+                let dx = fx - (ax + t * abx);
+                let dy = fy - (ay + t * aby);
+                let d2 = dx * dx + dy * dy;
+                if d2 > rad2 {
+                    continue;
+                }
+                let nz = (1.0 - d2 / rad2).max(0.0).sqrt();
+                let z = (az + t * (bz - az) - nz * r_z).clamp(0.0, 1.0);
+                if z < zbuf[row + px] {
+                    zbuf[row + px] = z;
+                }
+            }
+        }
+    }
+
+    zbuf
+}
+
 /// Render `scene` from `camera` into an RGBA8 byte buffer (`width * height * 4`) using indexed
-/// triangle rasterization + ray-cast impostor shading + Z-buffer SSAO + ChimeraX silhouettes.
+/// triangle rasterization + directional PCF 3×3 soft shadows + ray-cast impostor shading +
+/// Z-buffer SSAO + ChimeraX silhouettes.
 pub fn render_scene_rgba(
     scene: &RenderSceneData,
     camera: &Camera3D,
@@ -96,6 +250,44 @@ pub fn render_scene_rgba(
     let (right, up, fwd) = camera.basis();
     let half_h = (0.5 * camera.fov_y_rad).tan();
     let (clip_near, clip_far) = camera.clip_planes();
+
+    let shadow_str = scene.shadow_strength.clamp(0.0, 1.0);
+    let shadow_rad = scene.shadow_radius_around(camera.target, camera.distance * 0.65);
+    let light_vp = camera.light_view_proj_matrix(shadow_rad);
+    let shadow_zbuf: Option<Vec<f32>> = if shadow_str > 0.01 {
+        Some(build_shadow_depth_map(scene, &light_vp))
+    } else {
+        None
+    };
+
+    let sample_shadow = |world_pos: [f32; 3], ndotl: f32| -> f32 {
+        let Some(ref sz) = shadow_zbuf else {
+            return 1.0;
+        };
+        let ndc = transform_point_ndc(&light_vp, world_pos);
+        let u = ndc[0] * 0.5 + 0.5;
+        let v = 0.5 - ndc[1] * 0.5;
+        if u <= 0.002 || u >= 0.998 || v <= 0.002 || v >= 0.998 || ndc[2] <= 0.0 || ndc[2] >= 1.0 {
+            return 1.0;
+        }
+        let dim = SHADOW_DIM as i32;
+        let bx = (u * (SHADOW_DIM as f32)) as i32;
+        let by = (v * (SHADOW_DIM as f32)) as i32;
+        let bias = 0.0045 + 0.004 * (1.0 - ndotl.clamp(0.0, 1.0));
+        let z_cmp = ndc[2] - bias;
+        let mut occ = 0.0_f32;
+        for dy in -1..=1 {
+            let sy = (by + dy).clamp(0, dim - 1) as usize;
+            let row = sy * SHADOW_DIM;
+            for dx in -1..=1 {
+                let sx = (bx + dx).clamp(0, dim - 1) as usize;
+                if z_cmp > sz[row + sx] {
+                    occ += 1.0;
+                }
+            }
+        }
+        1.0 - (occ / 9.0) * 0.56 * shadow_str
+    };
 
     let project_pt = |p: [f32; 3]| -> Option<(f32, f32, f32, f32)> {
         let rel = [p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]];
@@ -120,16 +312,15 @@ pub fn render_scene_rgba(
         normalize3([cn[0] * flip, cn[1] * flip, (cn[2] * flip).max(0.02)])
     };
 
-    type ProjVert = (f32, f32, f32, [f32; 3], [f32; 4]);
+    type ProjVert = (f32, f32, f32, [f32; 3], [f32; 3], [f32; 4]);
     let project_meshes =
         |meshes: &[TriangleMesh], tris: &mut Vec<ProjTri>, wire_lines: &mut Vec<ProjLine>| {
             for mesh in meshes {
                 let mut pv: Vec<Option<ProjVert>> = Vec::with_capacity(mesh.vertices.len());
                 for v in &mesh.vertices {
-                    pv.push(
-                        project_pt(v.position)
-                            .map(|(sx, sy, z, _)| (sx, sy, z, cam_normal(v.normal), v.color)),
-                    );
+                    pv.push(project_pt(v.position).map(|(sx, sy, z, _)| {
+                        (sx, sy, z, v.position, cam_normal(v.normal), v.color)
+                    }));
                 }
                 for tri in mesh.indices.as_chunks::<3>().0 {
                     let (Some(a), Some(b), Some(c)) = (
@@ -151,7 +342,7 @@ pub fn render_scene_rgba(
                                     bx: q.0,
                                     by: q.1,
                                     bz: q.2,
-                                    color: p.4,
+                                    color: p.5,
                                     min_y,
                                     max_y,
                                 });
@@ -174,8 +365,9 @@ pub fn render_scene_rgba(
                         x: [a.0, b.0, c.0],
                         y: [a.1, b.1, c.1],
                         z: [a.2, b.2, c.2],
-                        n: [a.3, b.3, c.3],
-                        col: [a.4, b.4, c.4],
+                        wp: [a.3, b.3, c.3],
+                        n: [a.4, b.4, c.4],
+                        col: [a.5, b.5, c.5],
                         min_x: min_x.max(0),
                         max_x: max_x.min(width as i32 - 1),
                         min_y: min_y.max(0),
@@ -192,7 +384,6 @@ pub fn render_scene_rgba(
     project_meshes(&scene.opaque_meshes, &mut opaque_tris, &mut wire_lines);
     project_meshes(&scene.transparent_meshes, &mut transp_tris, &mut wire_lines);
 
-    // Tile-bin opaque & transparent triangles by scanline row so high-poly meshes stay blazing fast!
     let mut op_row_bins: Vec<Vec<u32>> = vec![Vec::new(); h];
     for (ti, t) in opaque_tris.iter().enumerate() {
         for bin in op_row_bins
@@ -238,6 +429,7 @@ pub fn render_scene_rgba(
                     z,
                     r_px,
                     r_a: sp.radius,
+                    center_world: sp.center,
                     color: sp.color,
                 };
                 if sp.color[3] >= 0.95 {
@@ -267,6 +459,8 @@ pub fn render_scene_rgba(
                     bx,
                     by,
                     bz,
+                    a_world: cap.a,
+                    b_world: cap.b,
                     r_px,
                     r_a: cap.radius,
                     dashed: cap.dashed > 0.5,
@@ -301,24 +495,28 @@ pub fn render_scene_rgba(
     };
 
     let z_ref = camera.distance.max(10.0);
-    let shade = |nx: f32, ny: f32, nz: f32, z: f32, col: [f32; 4]| -> [u8; 4] {
-        let d1 = (nx * light1[0] + ny * light1[1] + nz * light1[2]).max(0.0);
-        let d2 = (nx * light2[0] + ny * light2[1] + nz * light2[2]).max(0.0);
-        let spec = (nx * h1[0] + ny * h1[1] + nz * h1[2])
-            .max(0.0)
-            .powi(shininess)
-            * spec_k;
-        let rim = (1.0 - nz).clamp(0.0, 1.0).powi(3) * rim_k;
-        let fog = (1.0 - ((z - z_ref * 0.80) / (z_ref * 2.5)).clamp(0.0, 0.36)).clamp(0.64, 1.0);
-        let lit = (amb + diff_k * d1 + fill_k * d2) * fog;
-        let r = ((col[0] * lit + spec + rim) * 255.0).clamp(0.0, 255.0) as u8;
-        let g = ((col[1] * lit + spec + rim) * 255.0).clamp(0.0, 255.0) as u8;
-        let b = ((col[2] * lit + spec + rim) * 255.0).clamp(0.0, 255.0) as u8;
-        let a = (col[3].clamp(0.0, 1.0) * 255.0) as u8;
-        [r, g, b, a]
-    };
+    let shade =
+        |nx: f32, ny: f32, nz: f32, z: f32, col: [f32; 4], wp: Option<[f32; 3]>| -> [u8; 4] {
+            let d1 = (nx * light1[0] + ny * light1[1] + nz * light1[2]).max(0.0);
+            let d2 = (nx * light2[0] + ny * light2[1] + nz * light2[2]).max(0.0);
+            let sh = wp.map_or(1.0, |p| sample_shadow(p, d1));
+            let spec = (nx * h1[0] + ny * h1[1] + nz * h1[2])
+                .max(0.0)
+                .powi(shininess)
+                * spec_k
+                * sh;
+            let rim = (1.0 - nz).clamp(0.0, 1.0).powi(3) * rim_k;
+            let fog =
+                (1.0 - ((z - z_ref * 0.80) / (z_ref * 2.5)).clamp(0.0, 0.36)).clamp(0.64, 1.0);
+            let lit = (amb + diff_k * d1 * sh + fill_k * d2) * fog;
+            let r = ((col[0] * lit + spec + rim) * 255.0).clamp(0.0, 255.0) as u8;
+            let g = ((col[1] * lit + spec + rim) * 255.0).clamp(0.0, 255.0) as u8;
+            let b = ((col[2] * lit + spec + rim) * 255.0).clamp(0.0, 255.0) as u8;
+            let a = (col[3].clamp(0.0, 1.0) * 255.0) as u8;
+            [r, g, b, a]
+        };
 
-    // Pass 1: Parallel opaque scanline rasterization (returns per-row RGBA + Z-buffer)
+    // Pass 1: Parallel opaque scanline rasterization (with directional PCF 3×3 shadows)
     let opaque_rows: Vec<(Vec<u8>, Vec<f32>)> = (0..h)
         .into_par_iter()
         .map(|py| {
@@ -329,7 +527,7 @@ pub fn render_scene_rgba(
                 row_rgba[px * 4..px * 4 + 4].copy_from_slice(&bg_rgba);
             }
 
-            // 1A. Opaque indexed triangles (Cartoon ribbons, β-arrows, RNA slabs, opaque SES)
+            // 1A. Opaque indexed triangles
             for &ti in &op_row_bins[py] {
                 let t = &opaque_tris[ti as usize];
                 for px in (t.min_x as usize)..=(t.max_x as usize) {
@@ -360,8 +558,13 @@ pub fn render_scene_rgba(
                             w0 * t.col[0][2] + w1 * t.col[1][2] + w2 * t.col[2][2],
                             1.0,
                         ];
+                        let wp = [
+                            w0 * t.wp[0][0] + w1 * t.wp[1][0] + w2 * t.wp[2][0],
+                            w0 * t.wp[0][1] + w1 * t.wp[1][1] + w2 * t.wp[2][1],
+                            w0 * t.wp[0][2] + w1 * t.wp[1][2] + w2 * t.wp[2][2],
+                        ];
                         row_z[px] = z;
-                        let c = shade(nn[0], nn[1], nn[2], z, col);
+                        let c = shade(nn[0], nn[1], nn[2], z, col, Some(wp));
                         row_rgba[px * 4..px * 4 + 4].copy_from_slice(&c);
                     }
                 }
@@ -388,14 +591,22 @@ pub fn render_scene_rgba(
                     if z >= clip_near && z < row_z[px] {
                         let nx = dx / sp.r_px;
                         let ny = -dy / sp.r_px;
+                        let wp = [
+                            sp.center_world[0] + right[0] * (nx * sp.r_a) + up[0] * (ny * sp.r_a)
+                                - fwd[0] * (nz * sp.r_a),
+                            sp.center_world[1] + right[1] * (nx * sp.r_a) + up[1] * (ny * sp.r_a)
+                                - fwd[1] * (nz * sp.r_a),
+                            sp.center_world[2] + right[2] * (nx * sp.r_a) + up[2] * (ny * sp.r_a)
+                                - fwd[2] * (nz * sp.r_a),
+                        ];
                         row_z[px] = z;
-                        let c = shade(nx, ny, nz, z, sp.color);
+                        let c = shade(nx, ny, nz, z, sp.color, Some(wp));
                         row_rgba[px * 4..px * 4 + 4].copy_from_slice(&c);
                     }
                 }
             }
 
-            // 1C. Capsules (sticks, stems, H-bonds, GridBox wireframe)
+            // 1C. Capsules
             let ipy = py as i32;
             for cap in &capsules {
                 if ipy < cap.min_y || ipy > cap.max_y {
@@ -424,8 +635,16 @@ pub fn render_scene_rgba(
                     if z >= clip_near && z < row_z[px] {
                         let nx = dx / cap.r_px;
                         let ny = -dy / cap.r_px;
+                        let wp = [
+                            cap.a_world[0] + t * (cap.b_world[0] - cap.a_world[0])
+                                - fwd[0] * (nz * cap.r_a),
+                            cap.a_world[1] + t * (cap.b_world[1] - cap.a_world[1])
+                                - fwd[1] * (nz * cap.r_a),
+                            cap.a_world[2] + t * (cap.b_world[2] - cap.a_world[2])
+                                - fwd[2] * (nz * cap.r_a),
+                        ];
                         row_z[px] = z;
-                        let c = shade(nx, ny, nz, z, cap.color);
+                        let c = shade(nx, ny, nz, z, cap.color, Some(wp));
                         row_rgba[px * 4..px * 4 + 4].copy_from_slice(&c);
                     }
                 }
@@ -435,7 +654,6 @@ pub fn render_scene_rgba(
         })
         .collect();
 
-    // Flatten full-frame Z-buffer for Pass 2 (SSAO + Depth Silhouettes)
     let mut zbuf = Vec::with_capacity(w * h);
     let mut rgba_base = Vec::with_capacity(w * h * 4);
     for (r, z) in opaque_rows {
@@ -443,8 +661,7 @@ pub fn render_scene_rgba(
         zbuf.extend_from_slice(&z);
     }
 
-    // Pass 2 + Pass 3: Screen-space 12-tap Poisson SSAO + Depth-Discontinuity Silhouettes +
-    // Translucent Meshes / Wireframe Isomesh / Translucent Overlay Spheres (HYDE, ΔMIF, Pharm)
+    // Pass 2 + Pass 3: Screen-space 12-tap Poisson SSAO + Depth Silhouettes + Translucent Meshes/Wireframes/Overlays
     let ssao_str = scene.ssao_strength.clamp(0.0, 1.0);
     let do_sil = scene.show_silhouettes;
     let ssao_radius = ((w.min(h) as f32) / 140.0).clamp(2.5, 10.0);
@@ -476,7 +693,6 @@ pub fn render_scene_rgba(
             let mut row = rgba_base[row_off..row_off + w * 4].to_vec();
             let z_row = &zbuf[py * w..(py + 1) * w];
 
-            // 2. Apply SSAO & ChimeraX silhouettes onto opaque pixels
             if ssao_str > 0.01 || do_sil {
                 for (px, &d0) in z_row.iter().enumerate().take(w) {
                     if !d0.is_finite() {
@@ -520,7 +736,7 @@ pub fn render_scene_rgba(
                 }
             }
 
-            // 3A. Transparent meshes (smooth SES shell / Cryo-EM solid isosurface — nearest front layer per pixel)
+            // 3A. Transparent meshes (smooth SES shell / Binding Pocket cavity blobs / Cryo-EM)
             if !tr_row_bins[py].is_empty() {
                 let mut front_z = vec![f32::INFINITY; w];
                 let mut front_col = vec![[0u8; 4]; w];
@@ -555,7 +771,7 @@ pub fn render_scene_rgba(
                                 w0 * t.col[0][3] + w1 * t.col[1][3] + w2 * t.col[2][3],
                             ];
                             front_z[px] = z;
-                            front_col[px] = shade(nn[0], nn[1], nn[2], z, col);
+                            front_col[px] = shade(nn[0], nn[1], nn[2], z, col, None);
                         }
                     }
                 }
@@ -620,8 +836,7 @@ pub fn render_scene_rgba(
                     if z >= clip_near && z < z_bg {
                         let nx = dx / sp.r_px;
                         let ny = -dy / sp.r_px;
-                        let c = shade(nx, ny, nz, z, sp.color);
-                        // Fresnel-style translucent corona (brighter rim, clearer core)
+                        let c = shade(nx, ny, nz, z, sp.color, None);
                         let alpha = (sp.color[3] * (0.55 + 0.45 * (1.0 - nz))).clamp(0.08, 0.92);
                         let p4 = px * 4;
                         for k in 0..3 {
@@ -643,7 +858,6 @@ pub fn render_scene_rgba(
         out.append(&mut r);
     }
 
-    // Pass 4: Crisp 3D/2D labels, publication Color Key legend, and calibrated Scale Bar
     if !scene.labels_3d.is_empty()
         || !scene.labels_2d.is_empty()
         || scene.color_key.is_some()

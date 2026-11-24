@@ -8,9 +8,11 @@ pub mod analysis;
 pub mod io;
 pub mod measure;
 pub mod model;
+pub mod pockets;
 pub mod selection;
 pub mod symmetry;
 pub mod volume;
+pub mod xtc;
 
 pub use align::{
     RigidTransform, cealign_superpose, kabsch_superpose, matchmaker_align, morph_biomolecules,
@@ -37,6 +39,7 @@ pub use model::{
     black_mould_sap_hydro, classify_residue, covalent_radius, cpk_color, dist3, max_residue_sasa,
     nucleotide_color, vdw_radius,
 };
+pub use pockets::{BindingPocket3D, detect_binding_pockets};
 pub use selection::evaluate_selection;
 pub use symmetry::{
     AltLocRecord, SnfgGlycanLink, SnfgGlycanNode, SnfgGlycanReport, SnfgShape, SymmetryOp,
@@ -47,6 +50,7 @@ pub use volume::{
     MAX_VOLUME_VOXELS, MapFitReport, VolumeGrid3D, extract_isosurface_nodes, fit_model_in_map,
     parse_dx_map, parse_mrc_map, simulate_cryoem_map, write_mrc_map,
 };
+pub use xtc::{load_xtc_frames, write_xtc_frames};
 
 #[cfg(test)]
 mod tests {
@@ -456,6 +460,129 @@ END
         let deep_but_sane = format!("{}name CA{}", "(".repeat(32), ")".repeat(32));
         let mask = evaluate_selection(&mol, &deep_but_sane, &named)?;
         assert_eq!(mask.iter().filter(|m| **m).count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn wave8_xtc_compressed_roundtrip_and_3d_binding_pocket_detection() -> Result<(), BioStructError>
+    {
+        // 1. Small structure (<= 9 atoms -> uncompressed XTC path)
+        let small_pdb = "\
+ATOM      1  N   ALA A   1       1.000   2.000   3.000  1.00 20.00           N
+ATOM      2  CA  ALA A   1       2.450   2.100   3.200  1.00 20.00           C
+ATOM      3  C   ALA A   1       3.050   3.480   3.100  1.00 20.00           C
+END
+";
+        let mut small = parse_pdb("xtc_small", small_pdb)?;
+        small.frames = vec![
+            TrajectoryFrame {
+                frame_index: 0,
+                time_ps: 0.0,
+                coords: small.atoms.iter().map(|a| a.coords).collect(),
+            },
+            TrajectoryFrame {
+                frame_index: 1,
+                time_ps: 10.0,
+                coords: small
+                    .atoms
+                    .iter()
+                    .map(|a| [a.coords[0] + 1.5, a.coords[1] - 0.5, a.coords[2] + 0.25])
+                    .collect(),
+            },
+        ];
+        let small_bytes = write_xtc_frames(&small, 1000.0)?;
+        let mut small_rt = parse_pdb("xtc_small_rt", small_pdb)?;
+        let n_small = load_xtc_frames(&mut small_rt, &small_bytes)?;
+        assert_eq!(n_small, 2);
+        assert!((small_rt.frames[1].time_ps - 10.0).abs() < 1e-4);
+        assert!(dist3(small_rt.frames[1].coords[0], small.frames[1].coords[0]) < 1e-3);
+
+        // 2. Hollow protein sphere shell (>= 180 atoms -> full GROMACS 3dfcoord compressed XTC
+        //    AND synthetic buried hydrophobic/polar binding pocket around origin (0, 0, 0)!)
+        let mut pdb_pocket = String::new();
+        let mut serial = 1usize;
+        let res_cycle = ["LEU", "PHE", "VAL", "ILE", "ALA", "GLU", "ASP", "SER"];
+        let mut res_seq = 1i32;
+        for iz in -6..=6i32 {
+            for iy in -6..=6i32 {
+                for ix in -6..=6i32 {
+                    let x = ix as f64 * 2.2;
+                    let y = iy as f64 * 2.2;
+                    let z = iz as f64 * 2.2;
+                    let r = (x * x + y * y + z * z).sqrt();
+                    // Thick protein shell around a 5.6 Å radius inner cavity with a small mouth at +Z
+                    let is_mouth = z > 4.5 && (x * x + y * y).sqrt() < 2.8;
+                    if (5.6..=10.2).contains(&r) && !is_mouth {
+                        let rname = res_cycle[(res_seq as usize) % res_cycle.len()];
+                        pdb_pocket.push_str(&format!(
+                            "ATOM  {:5}  CA  {} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 20.00           C\n",
+                            serial, rname, res_seq, x, y, z
+                        ));
+                        serial += 1;
+                        res_seq += 1;
+                    }
+                }
+            }
+        }
+        pdb_pocket.push_str("END\n");
+        let mut big = parse_pdb("pocket_shell", &pdb_pocket)?;
+        assert!(big.atoms.len() > 80);
+
+        // Test compressed 3dfcoord XTC roundtrip across 3 frames
+        big.frames = (0..3)
+            .map(|f| TrajectoryFrame {
+                frame_index: f,
+                time_ps: f as f64 * 5.0,
+                coords: big
+                    .atoms
+                    .iter()
+                    .enumerate()
+                    .map(|(ai, a)| {
+                        let dx = (f as f64) * 0.35 * ((ai as f64) * 0.2).sin();
+                        [a.coords[0] + dx, a.coords[1] - 0.2 * f as f64, a.coords[2]]
+                    })
+                    .collect(),
+            })
+            .collect();
+        let xtc_bytes = write_xtc_frames(&big, 1000.0)?;
+        let mut big_rt = parse_pdb("pocket_shell_rt", &pdb_pocket)?;
+        let loaded = load_xtc_frames(&mut big_rt, &xtc_bytes)?;
+        assert_eq!(loaded, 3);
+        let mut max_err = 0.0_f64;
+        for f in 0..3 {
+            for (orig, dec) in big.frames[f]
+                .coords
+                .iter()
+                .zip(big_rt.frames[f].coords.iter())
+            {
+                max_err = max_err.max(dist3(*orig, *dec));
+            }
+        }
+        assert!(
+            max_err < 0.025,
+            "expected GROMACS 3dfcoord XTC roundtrip error < 0.025 Å, got {max_err:.5} Å"
+        );
+
+        // Test 3D binding pocket detector locates the central buried pocket near (0,0,0)
+        let pockets = detect_binding_pockets(&big, 5);
+        assert!(
+            !pockets.is_empty(),
+            "expected at least 1 detected 3D binding pocket"
+        );
+        let top = &pockets[0];
+        assert!(
+            dist3(top.center, [0.0, 0.0, 0.0]) < 2.2,
+            "expected pocket center near origin, got {:?}",
+            top.center
+        );
+        assert!(
+            top.volume_a3 > 80.0 && top.enclosure > 0.65 && top.druggability_score > 0.45,
+            "unexpected pocket metrics: vol={} enc={} drug={}",
+            top.volume_a3,
+            top.enclosure,
+            top.druggability_score
+        );
+        assert!(!top.lining_residues.is_empty() && !top.cavity_voxels.is_empty());
         Ok(())
     }
 }

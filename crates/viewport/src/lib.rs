@@ -12,17 +12,17 @@ pub mod mesh;
 pub mod movie;
 pub mod overlay_2d;
 
-pub use camera::{Camera3D, cross3, dot3, normalize3};
+pub use camera::{Camera3D, cross3, dot3, normalize3, transform_point_ndc};
 pub use geometry::{
     CapsuleInstance, RenderOptions, RenderSceneData, SphereInstance, build_render_scene,
     push_grid_box_wireframe, push_unit_cell_wireframe,
 };
-pub use gpu_renderer::{SharedViewportScene, show_biomol_viewport};
+pub use gpu_renderer::{SharedViewportScene, show_biomol_viewport, show_biomol_viewport_ex};
 pub use headless_png::{RenderError, render_scene_png_bytes, render_scene_rgba, write_scene_png};
 pub use mesh::{
-    MeshVertex, TriangleMesh, build_cartoon_mesh, build_orthoplanes_mesh, build_putty_mesh,
-    build_ses_surface_mesh, build_snfg_glycans_mesh, export_meshes_to_glb, export_meshes_to_obj,
-    extract_isosurface_mesh,
+    MeshVertex, TriangleMesh, build_cartoon_mesh, build_orthoplanes_mesh, build_pockets_mesh,
+    build_putty_mesh, build_ses_surface_mesh, build_snfg_glycans_mesh, export_meshes_to_glb,
+    export_meshes_to_obj, extract_isosurface_mesh,
 };
 pub use movie::{
     encode_gif89a, interpolate_camera, render_fly_frames, render_rock_frames,
@@ -228,6 +228,78 @@ END
         cam.focus_on_biomolecule(&mol);
         let png = render_scene_png_bytes(&scene, &cam, 240, 180, false)?;
         assert!(png.len() > 1000 && &png[..8] == b"\x89PNG\r\n\x1a\n");
+        Ok(())
+    }
+
+    #[test]
+    fn wave8_pcf_soft_shadows_pockets_mesh_and_drag_unproject()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use craftbio_struct::detect_binding_pockets;
+
+        // Build two overlapping stacked protein sheets so the upper sheet casts a clear shadow on the lower one
+        let mut pdb = String::new();
+        let mut serial = 1usize;
+        let mut res_seq = 1i32;
+        for iz in -5..=5i32 {
+            for iy in -5..=5i32 {
+                for ix in -5..=5i32 {
+                    let x = ix as f64 * 2.2;
+                    let y = iy as f64 * 2.2;
+                    let z = iz as f64 * 2.2;
+                    let r = (x * x + y * y + z * z).sqrt();
+                    let is_mouth = z > 4.5 && (x * x + y * y).sqrt() < 2.8;
+                    if (5.6..=10.0).contains(&r) && !is_mouth {
+                        pdb.push_str(&format!(
+                            "ATOM  {:5}  CA  LEU A{:4}    {:8.3}{:8.3}{:8.3}  1.00 20.00           C\n",
+                            serial, res_seq, x, y, z
+                        ));
+                        serial += 1;
+                        res_seq += 1;
+                    }
+                }
+            }
+        }
+        pdb.push_str("END\n");
+        let mol = parse_pdb("w8_shadow_pocket", &pdb)?;
+        let pockets = detect_binding_pockets(&mol, 3);
+        assert!(!pockets.is_empty());
+
+        let mut opts_no_shadow = RenderOptions {
+            representation: RepresentationKind::Spheres,
+            shadow_strength: 0.0,
+            ssao_strength: 0.0,
+            show_silhouettes: false,
+            binding_pockets: pockets.clone(),
+            selected_pocket_id: Some(1),
+            ..RenderOptions::default()
+        };
+        let scene_off = build_render_scene(&mol, &opts_no_shadow);
+        assert!(
+            !scene_off.transparent_meshes.is_empty(),
+            "expected smooth Marching-Tetrahedra binding pocket mesh"
+        );
+
+        opts_no_shadow.shadow_strength = 0.85;
+        let scene_on = build_render_scene(&mol, &opts_no_shadow);
+
+        let mut cam = Camera3D::default();
+        cam.focus_on_biomolecule(&mol);
+        let rgba_off = render_scene_rgba(&scene_off, &cam, 240, 180, false)?;
+        let rgba_on = render_scene_rgba(&scene_on, &cam, 240, 180, false)?;
+        let sum_off: u64 = rgba_off.iter().map(|&b| u64::from(b)).sum();
+        let sum_on: u64 = rgba_on.iter().map(|&b| u64::from(b)).sum();
+        assert!(
+            sum_on < sum_off,
+            "expected directional PCF 3x3 shadow map to visibly darken occluded pixels (off={sum_off}, on={sum_on})"
+        );
+
+        // Verify exact screen-delta unprojection for mouse Drag-to-Sculpt
+        let delta = cam.unproject_screen_delta_at_point([0.0, 0.0, 0.0], 20.0, -10.0, 600.0);
+        let mag = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+        assert!(
+            mag > 0.1 && mag < 20.0,
+            "unexpected unproject delta magnitude {mag}"
+        );
         Ok(())
     }
 }
