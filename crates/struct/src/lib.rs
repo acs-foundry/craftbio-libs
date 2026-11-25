@@ -28,8 +28,9 @@ pub use io::{
 };
 pub use measure::{
     ClashRecord, ContactRecord, GeometryAxis, GeometryPlane, HBondRecord, MsaAlignment, MsaRow,
-    PaeMatrix, axis_angle_deg, build_synchronized_msa, compute_best_fit_plane,
-    compute_geometry_axis, detect_clashes, detect_contacts, detect_hbonds,
+    PaeMatrix, SasaBurialReport, axis_angle_deg, build_synchronized_msa, compute_best_fit_plane,
+    compute_geometry_axis, compute_selection_sasa, detect_clashes, detect_clashes_between,
+    detect_contacts, detect_contacts_between, detect_hbonds, detect_hbonds_between,
     estimate_pae_proxy_from_structure, measure_angle_deg, measure_dihedral_deg, measure_distance,
     parse_pae_json,
 };
@@ -583,6 +584,50 @@ END
             top.druggability_score
         );
         assert!(!top.lining_residues.is_empty() && !top.cavity_voxels.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn wave9_sasa_burial_intermodel_checks_and_compact_bfactor_selection()
+    -> Result<(), BioStructError> {
+        let pdb_a = "\
+ATOM      1  N   THR A 315       0.000   0.000   0.000  1.00 92.00           N
+ATOM      2  CA  THR A 315       1.450   0.000   0.000  1.00 92.00           C
+ATOM      3  OG1 THR A 315       2.400   1.000   0.000  1.00 92.00           O
+HETATM    4  N13 STI A 601       5.250   1.000   0.000  1.00 45.00           N
+HETATM    5  C14 STI A 601       6.600   1.000   0.000  1.00 45.00           C
+END
+";
+        let pdb_b = "\
+ATOM      1  CA  ILE A 315       1.450   0.000   0.000  1.00 22.00           C
+ATOM      2  CD1 ILE A 315       4.250   1.000   0.000  1.00 22.00           C
+END
+";
+        let mol_a = parse_pdb("wt_sti", pdb_a)?;
+        let mol_b = parse_pdb("mut_3ik3", pdb_b)?;
+        let named = HashMap::new();
+
+        // Compact comparison syntax without spaces (`b>=90`, `b<=50`)
+        let hi = evaluate_selection(&mol_a, "b>=90", &named)?;
+        let lo = evaluate_selection(&mol_a, "b<=50", &named)?;
+        assert_eq!(hi.iter().filter(|&&v| v).count(), 3);
+        assert_eq!(lo.iter().filter(|&&v| v).count(), 2);
+
+        // SASA burial of ligand in complex vs alone
+        let lig_mask = evaluate_selection(&mol_a, "ligand", &named)?;
+        let sasa = compute_selection_sasa(&mol_a, &lig_mask, None);
+        assert_eq!(sasa.atom_count, 2);
+        assert!(sasa.isolated_sasa_a2 > 50.0);
+        assert!(sasa.complex_sasa_a2 < sasa.isolated_sasa_a2);
+        assert!(sasa.buried_fraction_pct > 1.0);
+
+        // Inter-model clash (Ile CD1 at 4.25 vs STI N13 at 5.25 -> dist 1.0 A, VDW overlap > 2.0 A!)
+        let clashes = detect_clashes_between(&mol_b, None, &mol_a, Some(&lig_mask), 0.60);
+        assert!(!clashes.is_empty());
+        assert!(clashes[0].overlap_a > 1.5);
+
+        let contacts = detect_contacts_between(&mol_b, None, &mol_a, Some(&lig_mask), 4.0, 20);
+        assert!(!contacts.is_empty());
         Ok(())
     }
 }

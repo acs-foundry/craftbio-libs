@@ -180,8 +180,10 @@ pub struct RenderOptions {
     /// Directional PCF 3×3 soft shadow map intensity (`0.0..=1.0`, default `0.55`).
     pub shadow_strength: f32,
     pub background: [f32; 4],
-    /// Optional per-residue custom highlight colors `(chain, res_seq) -> [r, g, b]` (e.g. IMGT CDRs, catalytic triads, RNA motifs).
+    /// Optional per-residue custom highlight colors `(chain, res_seq) -> [r, g, b]` (also renders sidechain sticks, e.g. IMGT CDRs, catalytic triads, pocket residues).
     pub residue_highlights: HashMap<(char, i32), [f32; 3]>,
+    /// Optional per-residue custom palette colors `(chain, res_seq) -> [r, g, b]` applied to ribbons & surfaces WITHOUT forcing sticks (e.g. 3D aggregation propensity maps).
+    pub residue_colors: HashMap<(char, i32), [f32; 3]>,
     pub sphere_overlays: Vec<SphereOverlay>,
     pub line_overlays: Vec<LineOverlay>,
     pub selected_atoms: Vec<bool>,
@@ -225,6 +227,7 @@ impl Default for RenderOptions {
             shadow_strength: 0.55,
             background: [0.06, 0.08, 0.12, 1.0],
             residue_highlights: HashMap::new(),
+            residue_colors: HashMap::new(),
             sphere_overlays: Vec::new(),
             line_overlays: Vec::new(),
             selected_atoms: Vec::new(),
@@ -313,6 +316,49 @@ fn plddt_colormap(b: f64) -> [f32; 3] {
         [0.99, 0.84, 0.22]
     } else {
         [0.98, 0.48, 0.25]
+    }
+}
+
+/// ChimeraX-style N→C spectral rainbow colormap (`t` in `[0.0, 1.0]`: blue → cyan → green → yellow → red).
+fn rainbow_colormap(t: f32) -> [f32; 3] {
+    let stops: &[[f32; 3]] = &[
+        [0.14, 0.34, 0.92], // N-term blue
+        [0.12, 0.74, 0.88], // cyan
+        [0.24, 0.82, 0.44], // green
+        [0.96, 0.82, 0.18], // yellow
+        [0.95, 0.46, 0.16], // orange
+        [0.88, 0.18, 0.22], // C-term red
+    ];
+    let u = t.clamp(0.0, 1.0) * ((stops.len() - 1) as f32);
+    let idx = (u.floor() as usize).min(stops.len() - 2);
+    let f = u - idx as f32;
+    let a = stops[idx];
+    let b = stops[idx + 1];
+    [
+        a[0] + (b[0] - a[0]) * f,
+        a[1] + (b[1] - a[1]) * f,
+        a[2] + (b[2] - a[2]) * f,
+    ]
+}
+
+/// Crystallographic B-factor colormap (ChimeraX convention: blue = low/ordered → white = median → red = high/mobile).
+fn bfactor_colormap(b: f64, lo: f64, hi: f64) -> [f32; 3] {
+    let span = (hi - lo).max(1.0);
+    let t = (((b - lo) / span) as f32).clamp(0.0, 1.0);
+    if t <= 0.5 {
+        let u = t * 2.0; // blue -> white
+        [
+            0.14 + 0.82 * u,
+            0.38 + 0.58 * u,
+            0.94 + 0.02 * u,
+        ]
+    } else {
+        let u = (t - 0.5) * 2.0; // white -> red
+        [
+            0.96 - 0.04 * u,
+            0.96 - 0.78 * u,
+            0.96 - 0.78 * u,
+        ]
     }
 }
 
@@ -433,6 +479,52 @@ pub fn build_render_scene(mol: &Biomolecule, opts: &RenderOptions) -> RenderScen
         None
     };
 
+    let rainbow_frac: HashMap<(char, i32), f32> = if opts.color_scheme == ColorScheme::Rainbow {
+        let mut map = HashMap::new();
+        for ch in &mol.chains {
+            let poly: Vec<i32> = ch
+                .residues
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        r.class,
+                        ResidueClass::Protein | ResidueClass::Rna | ResidueClass::Dna
+                    )
+                })
+                .map(|r| r.res_seq)
+                .collect();
+            let denom = poly.len().saturating_sub(1).max(1) as f32;
+            for (i, rseq) in poly.into_iter().enumerate() {
+                map.insert((ch.id, rseq), (i as f32) / denom);
+            }
+        }
+        map
+    } else {
+        HashMap::new()
+    };
+
+    let (bf_lo, bf_hi) = if opts.color_scheme == ColorScheme::CrystallographicBfactor {
+        let mut bs: Vec<f64> = mol
+            .atoms
+            .iter()
+            .filter(|a| a.res_class != ResidueClass::Water && a.element != "H")
+            .map(|a| a.b_factor)
+            .filter(|v| v.is_finite())
+            .collect();
+        bs.sort_by(f64::total_cmp);
+        if bs.len() >= 4 {
+            let lo = bs[bs.len() / 20];
+            let hi = bs[(bs.len() * 19) / 20].max(lo + 10.0);
+            (lo, hi)
+        } else if let (Some(&lo), Some(&hi)) = (bs.first(), bs.last()) {
+            (lo, hi.max(lo + 10.0))
+        } else {
+            (10.0, 80.0)
+        }
+    } else {
+        (10.0, 80.0)
+    };
+
     let mut chain_index_map: HashMap<char, usize> = HashMap::new();
     for (ci, ch) in mol.chains.iter().enumerate() {
         chain_index_map.insert(ch.id, ci);
@@ -452,6 +544,12 @@ pub fn build_render_scene(mol: &Biomolecule, opts: &RenderOptions) -> RenderScen
         if let Some(&hi) = opts.residue_highlights.get(&(a.chain, a.res_seq)) {
             return hi;
         }
+        if let Some(&rc) = opts.residue_colors.get(&(a.chain, a.res_seq))
+            && a.res_class != ResidueClass::Ligand
+            && a.res_class != ResidueClass::Ion
+        {
+            return rc;
+        }
         if opts.selected_atoms.get(idx).copied().unwrap_or(false) {
             return [0.99, 0.90, 0.25];
         }
@@ -464,6 +562,14 @@ pub fn build_render_scene(mol: &Biomolecule, opts: &RenderOptions) -> RenderScen
                     chain_color(chain_index_map.get(&a.chain).copied().unwrap_or(0))
                 }
             }
+            ColorScheme::Rainbow => {
+                if a.res_class == ResidueClass::Ligand || a.res_class == ResidueClass::Ion {
+                    cpk_color(&a.element)
+                } else {
+                    let t = rainbow_frac.get(&(a.chain, a.res_seq)).copied().unwrap_or(0.5);
+                    rainbow_colormap(t)
+                }
+            }
             ColorScheme::SecondaryStructure => match ss {
                 SecondaryStructure::Helix => [0.92, 0.28, 0.42],
                 SecondaryStructure::Sheet => [0.96, 0.72, 0.16],
@@ -471,6 +577,7 @@ pub fn build_render_scene(mol: &Biomolecule, opts: &RenderOptions) -> RenderScen
                 SecondaryStructure::NucleicRibbon => nucleotide_color(a.res_code),
             },
             ColorScheme::BfactorPlddt => plddt_colormap(a.b_factor),
+            ColorScheme::CrystallographicBfactor => bfactor_colormap(a.b_factor, bf_lo, bf_hi),
             ColorScheme::Sap3D => sap_vals
                 .as_ref()
                 .map_or([0.8, 0.8, 0.8], |v| sap_colormap(v[idx])),
@@ -546,11 +653,13 @@ pub fn build_render_scene(mol: &Biomolecule, opts: &RenderOptions) -> RenderScen
         let atom_cols: Vec<[f32; 3]> = (0..mol.atoms.len())
             .map(|i| atom_color(i, ss_by_atom[i]))
             .collect();
-        let alpha = if opts.representation == RepresentationKind::Surface && !opts.surface_wireframe
+        let alpha = if opts.representation == RepresentationKind::Surface
+            && !opts.surface_wireframe
+            && opts.surface_alpha >= 0.99
         {
             1.0
         } else {
-            opts.surface_alpha.clamp(0.18, 0.96)
+            opts.surface_alpha.clamp(0.05, 1.0)
         };
         let surf_mesh = build_ses_surface_mesh(
             mol,

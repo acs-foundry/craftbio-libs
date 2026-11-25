@@ -302,4 +302,68 @@ END
         );
         Ok(())
     }
+
+    #[test]
+    fn wave9_rainbow_bfactor_and_non_stick_residue_colors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::collections::HashMap;
+        let pdb = "\
+ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 12.00           N
+ATOM      2  CA  ALA A   1       1.450   0.000   0.000  1.00 12.00           C
+ATOM      3  C   ALA A   1       2.050   1.380   0.000  1.00 12.00           C
+ATOM      4  O   ALA A   1       1.350   2.380   0.000  1.00 12.00           O
+ATOM      5  N   GLY A   2       3.360   1.420   0.000  1.00 45.00           N
+ATOM      6  CA  GLY A   2       4.100   2.680   0.200  1.00 45.00           C
+ATOM      7  C   GLY A   2       5.580   2.500   0.000  1.00 45.00           C
+ATOM      8  O   GLY A   2       6.120   1.420  -0.200  1.00 45.00           O
+ATOM      9  N   TYR A   3       6.240   3.650   0.100  1.00 85.00           N
+ATOM     10  CA  TYR A   3       7.680   3.750   0.000  1.00 85.00           C
+ATOM     11  C   TYR A   3       8.280   5.120   0.100  1.00 85.00           C
+ATOM     12  O   TYR A   3       7.600   6.120   0.200  1.00 85.00           O
+END
+";
+        let mol = parse_pdb("w9_pal", pdb)?;
+        let mut rc = HashMap::new();
+        rc.insert(('A', 1), [0.1, 0.3, 0.9]);
+        rc.insert(('A', 2), [0.9, 0.9, 0.9]);
+        rc.insert(('A', 3), [0.9, 0.2, 0.2]);
+
+        let sc_rc = build_render_scene(
+            &mol,
+            &RenderOptions {
+                representation: RepresentationKind::Cartoon,
+                residue_colors: rc,
+                ..RenderOptions::default()
+            },
+        );
+        assert!(
+            sc_rc.capsules.is_empty(),
+            "residue_colors must NOT force sticks in Cartoon mode"
+        );
+
+        let sc_rb = build_render_scene(
+            &mol,
+            &RenderOptions {
+                representation: RepresentationKind::Cartoon,
+                color_scheme: ColorScheme::Rainbow,
+                ..RenderOptions::default()
+            },
+        );
+        assert!(!sc_rb.opaque_meshes.is_empty());
+
+        let sc_bf = build_render_scene(
+            &mol,
+            &RenderOptions {
+                representation: RepresentationKind::Surface,
+                color_scheme: ColorScheme::CrystallographicBfactor,
+                surface_alpha: 0.40,
+                ..RenderOptions::default()
+            },
+        );
+        assert!(
+            !sc_bf.transparent_meshes.is_empty(),
+            "surface_alpha < 0.99 must produce translucent surface even in Surface representation"
+        );
+        Ok(())
+    }
 }

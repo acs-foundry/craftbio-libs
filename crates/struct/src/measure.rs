@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use serde::{Deserialize, Serialize};
 
 use crate::align::{jacobi_sym3, smith_waterman_pairs};
+use crate::analysis::compute_sasa;
 use crate::model::{BioStructError, Biomolecule, ResidueClass, dist3, vdw_radius};
 
 /// Detected hydrogen bond (ChimeraX `hbonds` / PyMOL polar contacts).
@@ -897,4 +898,311 @@ pub fn estimate_pae_proxy_from_structure(mol: &Biomolecule) -> PaeMatrix {
         is_experimental_json: false,
         domain_blocks,
     }
+}
+
+/// Solvent-accessible surface area (SASA) & burial report for a selected subset of atoms.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SasaBurialReport {
+    pub atom_count: usize,
+    pub isolated_sasa_a2: f64,
+    pub complex_sasa_a2: f64,
+    pub buried_sasa_a2: f64,
+    pub buried_fraction_pct: f64,
+}
+
+/// Compute Shrake-Rupley SASA (`1.4 Å` probe, 92 Fibonacci points) of `target_mask` both
+/// isolated (alone in solvent) and in the presence of `context_mask` (or all non-water atoms
+/// of `mol` when `context_mask` is `None`), reporting buried surface area (`ΔSASA` & `% buried`).
+#[must_use]
+pub fn compute_selection_sasa(
+    mol: &Biomolecule,
+    target_mask: &[bool],
+    context_mask: Option<&[bool]>,
+) -> SasaBurialReport {
+    let mut target_atoms = Vec::new();
+    let mut complex_atoms = Vec::new();
+    let mut target_in_complex_indices = Vec::new();
+
+    for (i, a) in mol.atoms.iter().enumerate() {
+        let is_target = target_mask.get(i).copied().unwrap_or(false);
+        let is_ctx = match context_mask {
+            Some(cm) => cm.get(i).copied().unwrap_or(false),
+            None => a.res_class != ResidueClass::Water,
+        };
+        if is_target {
+            target_atoms.push(a.clone());
+            target_in_complex_indices.push(complex_atoms.len());
+            complex_atoms.push(a.clone());
+        } else if is_ctx {
+            complex_atoms.push(a.clone());
+        }
+    }
+
+    if target_atoms.is_empty() {
+        return SasaBurialReport {
+            atom_count: 0,
+            isolated_sasa_a2: 0.0,
+            complex_sasa_a2: 0.0,
+            buried_sasa_a2: 0.0,
+            buried_fraction_pct: 0.0,
+        };
+    }
+
+    let sasa_iso: f64 = compute_sasa(&target_atoms, 1.4, 92).iter().sum();
+    let sasa_all = compute_sasa(&complex_atoms, 1.4, 92);
+    let sasa_cpx: f64 = target_in_complex_indices
+        .iter()
+        .filter_map(|&idx| sasa_all.get(idx).copied())
+        .sum();
+    let buried = (sasa_iso - sasa_cpx).max(0.0);
+    let pct = if sasa_iso > 1e-6 {
+        (buried / sasa_iso * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    let r2 = |v: f64| (v * 100.0).round() / 100.0;
+    SasaBurialReport {
+        atom_count: target_atoms.len(),
+        isolated_sasa_a2: r2(sasa_iso),
+        complex_sasa_a2: r2(sasa_cpx),
+        buried_sasa_a2: r2(buried),
+        buried_fraction_pct: (pct * 10.0).round() / 10.0,
+    }
+}
+
+/// Detect geometric hydrogen bonds strictly BETWEEN two distinct models (`interModel true`).
+#[must_use]
+pub fn detect_hbonds_between(
+    mol_a: &Biomolecule,
+    mask_a: Option<&[bool]>,
+    mol_b: &Biomolecule,
+    mask_b: Option<&[bool]>,
+    max_dist_a: f64,
+    min_angle_deg: f64,
+) -> Vec<HBondRecord> {
+    if mol_a.atoms.is_empty() || mol_b.atoms.is_empty() {
+        return Vec::new();
+    }
+    let adj_a = build_adjacency(mol_a);
+    let adj_b = build_adjacency(mol_b);
+    let cutoff = max_dist_a.clamp(2.2, 4.2);
+    let cutoff2 = cutoff * cutoff;
+    let cell = cutoff.max(3.5);
+    let ckey = |c: [f64; 3]| -> (i32, i32, i32) {
+        (
+            (c[0] / cell).floor() as i32,
+            (c[1] / cell).floor() as i32,
+            (c[2] / cell).floor() as i32,
+        )
+    };
+    let in_a = |i: usize| mask_a.is_none_or(|m| m.get(i).copied().unwrap_or(false));
+    let in_b = |i: usize| mask_b.is_none_or(|m| m.get(i).copied().unwrap_or(false));
+
+    let mut grid_b: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
+    for (j, b) in mol_b.atoms.iter().enumerate() {
+        if in_b(j) && is_polar_hbond_atom(&b.element) && b.res_class != ResidueClass::Water {
+            grid_b.entry(ckey(b.coords)).or_default().push(j);
+        }
+    }
+
+    let mut out = Vec::new();
+    for (i, a) in mol_a.atoms.iter().enumerate() {
+        if !in_a(i) || !is_polar_hbond_atom(&a.element) || a.res_class == ResidueClass::Water {
+            continue;
+        }
+        let (cx, cy, cz) = ckey(a.coords);
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let Some(nbrs) = grid_b.get(&(cx + dx, cy + dy, cz + dz)) else {
+                        continue;
+                    };
+                    for &j in nbrs {
+                        let b = &mol_b.atoms[j];
+                        let d2 = (a.coords[0] - b.coords[0]).powi(2)
+                            + (a.coords[1] - b.coords[1]).powi(2)
+                            + (a.coords[2] - b.coords[2]).powi(2);
+                        if d2 < 2.2 * 2.2 || d2 > cutoff2 {
+                            continue;
+                        }
+                        let d = d2.sqrt();
+                        let ang_a = adj_a[i]
+                            .first()
+                            .map(|&bi| measure_angle_deg(mol_a.atoms[bi].coords, a.coords, b.coords))
+                            .unwrap_or(140.0);
+                        let ang_b = adj_b[j]
+                            .first()
+                            .map(|&bj| measure_angle_deg(mol_b.atoms[bj].coords, b.coords, a.coords))
+                            .unwrap_or(140.0);
+                        let best_ang = ang_a.min(ang_b);
+                        if best_ang < min_angle_deg {
+                            continue;
+                        }
+                        let dist_f = (1.0 - ((d - 2.85).abs() / 0.95)).clamp(0.15, 1.0);
+                        let ang_f = ((best_ang - 90.0) / 80.0).clamp(0.2, 1.0);
+                        let energy = -((2.8 * dist_f * ang_f) * 100.0).round() / 100.0;
+                        out.push(HBondRecord {
+                            atom_a: i,
+                            atom_b: j,
+                            label_a: atom_label(mol_a, i),
+                            label_b: atom_label(mol_b, j),
+                            coords_a: a.coords,
+                            coords_b: b.coords,
+                            distance_a: (d * 100.0).round() / 100.0,
+                            angle_deg: (best_ang * 10.0).round() / 10.0,
+                            energy_kcal: energy,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.distance_a.total_cmp(&b.distance_a));
+    out
+}
+
+/// Detect steric atomic clashes strictly BETWEEN two distinct models (`interModel true`).
+#[must_use]
+pub fn detect_clashes_between(
+    mol_a: &Biomolecule,
+    mask_a: Option<&[bool]>,
+    mol_b: &Biomolecule,
+    mask_b: Option<&[bool]>,
+    overlap_cutoff_a: f64,
+) -> Vec<ClashRecord> {
+    if mol_a.atoms.is_empty() || mol_b.atoms.is_empty() {
+        return Vec::new();
+    }
+    let cell = 4.0_f64;
+    let ckey = |c: [f64; 3]| -> (i32, i32, i32) {
+        (
+            (c[0] / cell).floor() as i32,
+            (c[1] / cell).floor() as i32,
+            (c[2] / cell).floor() as i32,
+        )
+    };
+    let in_a = |i: usize| mask_a.is_none_or(|m| m.get(i).copied().unwrap_or(false));
+    let in_b = |i: usize| mask_b.is_none_or(|m| m.get(i).copied().unwrap_or(false));
+
+    let mut grid_b: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
+    for (j, b) in mol_b.atoms.iter().enumerate() {
+        if in_b(j) && b.res_class != ResidueClass::Water && b.element != "H" {
+            grid_b.entry(ckey(b.coords)).or_default().push(j);
+        }
+    }
+
+    let mut out = Vec::new();
+    for (i, a) in mol_a.atoms.iter().enumerate() {
+        if !in_a(i) || a.res_class == ResidueClass::Water || a.element == "H" {
+            continue;
+        }
+        let ra = vdw_radius(&a.element);
+        let (cx, cy, cz) = ckey(a.coords);
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let Some(nbrs) = grid_b.get(&(cx + dx, cy + dy, cz + dz)) else {
+                        continue;
+                    };
+                    for &j in nbrs {
+                        let b = &mol_b.atoms[j];
+                        let d = dist3(a.coords, b.coords);
+                        let overlap = (ra + vdw_radius(&b.element)) - d;
+                        if overlap < overlap_cutoff_a {
+                            continue;
+                        }
+                        if is_polar_hbond_atom(&a.element)
+                            && is_polar_hbond_atom(&b.element)
+                            && d >= 2.35
+                        {
+                            continue;
+                        }
+                        out.push(ClashRecord {
+                            atom_a: i,
+                            atom_b: j,
+                            label_a: atom_label(mol_a, i),
+                            label_b: atom_label(mol_b, j),
+                            coords_a: a.coords,
+                            coords_b: b.coords,
+                            distance_a: (d * 100.0).round() / 100.0,
+                            overlap_a: (overlap * 100.0).round() / 100.0,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| b.overlap_a.total_cmp(&a.overlap_a));
+    out
+}
+
+/// Detect non-covalent heavy-atom contacts strictly BETWEEN two distinct models (`interModel true`).
+#[must_use]
+pub fn detect_contacts_between(
+    mol_a: &Biomolecule,
+    mask_a: Option<&[bool]>,
+    mol_b: &Biomolecule,
+    mask_b: Option<&[bool]>,
+    max_dist_a: f64,
+    max_results: usize,
+) -> Vec<ContactRecord> {
+    if mol_a.atoms.is_empty() || mol_b.atoms.is_empty() {
+        return Vec::new();
+    }
+    let cutoff = max_dist_a.clamp(2.0, 6.0);
+    let cutoff2 = cutoff * cutoff;
+    let cell = cutoff.max(3.5);
+    let ckey = |c: [f64; 3]| -> (i32, i32, i32) {
+        (
+            (c[0] / cell).floor() as i32,
+            (c[1] / cell).floor() as i32,
+            (c[2] / cell).floor() as i32,
+        )
+    };
+    let in_a = |i: usize| mask_a.is_none_or(|m| m.get(i).copied().unwrap_or(false));
+    let in_b = |i: usize| mask_b.is_none_or(|m| m.get(i).copied().unwrap_or(false));
+
+    let mut grid_b: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
+    for (j, b) in mol_b.atoms.iter().enumerate() {
+        if in_b(j) && b.res_class != ResidueClass::Water && b.element != "H" {
+            grid_b.entry(ckey(b.coords)).or_default().push(j);
+        }
+    }
+
+    let mut out = Vec::new();
+    for (i, a) in mol_a.atoms.iter().enumerate() {
+        if !in_a(i) || a.res_class == ResidueClass::Water || a.element == "H" {
+            continue;
+        }
+        let (cx, cy, cz) = ckey(a.coords);
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let Some(nbrs) = grid_b.get(&(cx + dx, cy + dy, cz + dz)) else {
+                        continue;
+                    };
+                    for &j in nbrs {
+                        let b = &mol_b.atoms[j];
+                        let d2 = (a.coords[0] - b.coords[0]).powi(2)
+                            + (a.coords[1] - b.coords[1]).powi(2)
+                            + (a.coords[2] - b.coords[2]).powi(2);
+                        if d2 <= cutoff2 {
+                            out.push(ContactRecord {
+                                atom_a: i,
+                                atom_b: j,
+                                label_a: atom_label(mol_a, i),
+                                label_b: atom_label(mol_b, j),
+                                coords_a: a.coords,
+                                coords_b: b.coords,
+                                distance_a: (d2.sqrt() * 100.0).round() / 100.0,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.distance_a.total_cmp(&b.distance_a));
+    out.truncate(max_results);
+    out
 }

@@ -34,7 +34,11 @@ fn tokenize(expr: &str) -> Vec<Tok> {
             _ => out.push(Tok::Word(w)),
         }
     };
-    for ch in expr.chars() {
+    let chars: Vec<char> = expr.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        let next = chars.get(i + 1).copied();
         match ch {
             '(' => {
                 flush(&mut cur, &mut out);
@@ -52,13 +56,28 @@ fn tokenize(expr: &str) -> Vec<Tok> {
                 flush(&mut cur, &mut out);
                 out.push(Tok::Or);
             }
+            '!' if next == Some('=') => {
+                flush(&mut cur, &mut out);
+                out.push(Tok::Word("!=".to_string()));
+                i += 1;
+            }
             '!' => {
                 flush(&mut cur, &mut out);
                 out.push(Tok::Not);
             }
+            '>' | '<' | '=' => {
+                flush(&mut cur, &mut out);
+                if next == Some('=') {
+                    out.push(Tok::Word(format!("{ch}=")));
+                    i += 1;
+                } else {
+                    out.push(Tok::Word(ch.to_string()));
+                }
+            }
             c if c.is_whitespace() => flush(&mut cur, &mut out),
             _ => cur.push(ch),
         }
+        i += 1;
     }
     flush(&mut cur, &mut out);
     out
@@ -344,6 +363,7 @@ impl<'a> Parser<'a> {
                                 ">=" => a.b_factor >= val,
                                 "<" => a.b_factor < val,
                                 "<=" => a.b_factor <= val,
+                                "!=" => (a.b_factor - val).abs() >= 1e-3,
                                 _ => (a.b_factor - val).abs() < 1e-3,
                             })
                             .collect())
