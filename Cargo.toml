@@ -6,6 +6,7 @@ members = [
     "crates/scene",
     "crates/viewport",
     "crates/report",
+    "crates/fetch",
 ]
 
 [workspace.package]
@@ -33,6 +34,7 @@ craft-ipc = { git = "https://github.com/storytold/craft-libs", rev = "52d2560c18
 # Internal workspace crates
 craftbio-struct = { path = "crates/struct" }
 craftbio-scene = { path = "crates/scene" }
+craftbio-report = { path = "crates/report" }
 
 # Standard Rust ecosystem crates (offline-cached)
 bytemuck = { version = "1", features = ["derive"] }

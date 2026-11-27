@@ -220,6 +220,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "craftbio-fetch"
+version = "1.3.0"
+dependencies = [
+ "craftbio-report",
+]
+
+[[package]]
 name = "craftbio-report"
 version = "1.3.0"
 dependencies = [
