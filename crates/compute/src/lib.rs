@@ -498,6 +498,9 @@ mod tests {
         // Verify fixed_positions.jsonl carries outer PDB-stem key (prevents silent full redesign!)
         let fixed_raw = fs::read_to_string(dir.join("inputs/fixed_positions.jsonl"))?;
         assert!(fixed_raw.contains("\"backbone\""));
+        // Verify emitted Python script preserves 4-space indentation
+        let mpnn_py = fs::read_to_string(dir.join("run_mpnn.py"))?;
+        assert!(mpnn_py.contains("\n    cmd.append('--use_soluble_model')\n"));
 
         let loaded = load_and_verify_bundle(&dir)?;
         assert_eq!(loaded.runbook.as_deref(), Some("proteinmpnn-ligandmpnn"));

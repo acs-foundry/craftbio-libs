@@ -221,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "craftbio-compute"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -230,14 +230,14 @@ dependencies = [
 
 [[package]]
 name = "craftbio-fetch"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "craftbio-report",
 ]
 
 [[package]]
 name = "craftbio-report"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "craftbio-sandbox"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "rustix",
  "serde",
@@ -254,7 +254,7 @@ dependencies = [
 
 [[package]]
 name = "craftbio-scene"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "craft-ipc",
  "crc32fast",
@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "craftbio-struct"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "rayon",
  "serde",
@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "craftbio-viewport"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "bytemuck",
  "craftbio-scene",

@@ -109,15 +109,17 @@ pub fn build_dockcraft_cofold_bundle(
                 }
             }
         }
-        let script = "import importlib.util, shutil, subprocess, sys\n\
-from pathlib import Path\n\
-out = Path('/content/outputs')\n\
-out.mkdir(parents=True, exist_ok=True)\n\
-if shutil.which('chai-lab') is None:\n\
-    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', 'chai_lab'])\n\
-cmd = ['chai-lab', 'fold', '/content/inputs/complex.fasta', str(out)]\n\
-sys.exit(subprocess.call(cmd))\n"
-            .to_string();
+        let script = concat!(
+            "import shutil, subprocess, sys\n",
+            "from pathlib import Path\n",
+            "out = Path('/content/outputs')\n",
+            "out.mkdir(parents=True, exist_ok=True)\n",
+            "if shutil.which('chai-lab') is None:\n",
+            "    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', 'chai_lab'])\n",
+            "cmd = ['chai-lab', 'fold', '/content/inputs/complex.fasta', str(out)]\n",
+            "sys.exit(subprocess.call(cmd))\n",
+        )
+        .to_string();
         let cmd = vec![
             "chai-lab".to_string(),
             "fold".to_string(),
@@ -136,31 +138,35 @@ sys.exit(subprocess.call(cmd))\n"
             ""
         };
         let script = format!(
-            "import importlib.util, json, shutil, subprocess, sys\n\
-from pathlib import Path\n\
-work = Path('/content/boltz_work')\n\
-out = Path('/content/outputs')\n\
-work.mkdir(parents=True, exist_ok=True)\n\
-out.mkdir(parents=True, exist_ok=True)\n\
-if shutil.which('boltz') is None:\n\
-    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', 'boltz'])\n\
-cmd = ['boltz', 'predict', '/content/inputs/complex.yaml', '--out_dir', str(work), '--diffusion_samples', '{samples}']\n\
-if '{msa_flag}':\n\
-    cmd.append('{msa_flag}')\n\
-if importlib.util.find_spec('cuequivariance_ops_torch') is None:\n\
-    cmd.append('--no_kernels')\n\
-rc = subprocess.call(cmd)\n\
-copied = []\n\
-for p in sorted(work.rglob('*')):\n\
-    if not p.is_file():\n\
-        continue\n\
-    low = p.name.lower()\n\
-    if low.endswith(('.cif', '.pdb')) or ((low.startswith('confidence') or low.startswith('affinity')) and low.endswith('.json')):\n\
-        dst = out / p.name\n\
-        shutil.copy2(p, dst)\n\
-        copied.append(p.name)\n\
-(out / 'cofold_run_summary.json').write_text(json.dumps({{'rc': rc, 'cmd': cmd, 'artifacts': copied}}, indent=2) + '\\n', encoding='utf-8')\n\
-sys.exit(rc)\n"
+            concat!(
+                "import importlib.util, json, shutil, subprocess, sys\n",
+                "from pathlib import Path\n",
+                "work = Path('/content/boltz_work')\n",
+                "out = Path('/content/outputs')\n",
+                "work.mkdir(parents=True, exist_ok=True)\n",
+                "out.mkdir(parents=True, exist_ok=True)\n",
+                "if shutil.which('boltz') is None:\n",
+                "    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', 'boltz'])\n",
+                "cmd = ['boltz', 'predict', '/content/inputs/complex.yaml', '--out_dir', str(work), '--diffusion_samples', '{samples}']\n",
+                "if '{msa_flag}':\n",
+                "    cmd.append('{msa_flag}')\n",
+                "if importlib.util.find_spec('cuequivariance_ops_torch') is None:\n",
+                "    cmd.append('--no_kernels')\n",
+                "rc = subprocess.call(cmd)\n",
+                "copied = []\n",
+                "for p in sorted(work.rglob('*')):\n",
+                "    if not p.is_file():\n",
+                "        continue\n",
+                "    low = p.name.lower()\n",
+                "    if low.endswith(('.cif', '.pdb')) or ((low.startswith('confidence') or low.startswith('affinity')) and low.endswith('.json')):\n",
+                "        dst = out / p.name\n",
+                "        shutil.copy2(p, dst)\n",
+                "        copied.append(p.name)\n",
+                "(out / 'cofold_run_summary.json').write_text(json.dumps({{'rc': rc, 'cmd': cmd, 'artifacts': copied}}, indent=2) + '\\n', encoding='utf-8')\n",
+                "sys.exit(rc)\n",
+            ),
+            samples = samples,
+            msa_flag = msa_flag,
         );
         let mut cmd = vec![
             "boltz".to_string(),
@@ -285,17 +291,24 @@ pub fn build_biomolcraft_mpnn_bundle(
         ""
     };
     let runner_script = format!(
-        "import subprocess, sys\n\
-         from pathlib import Path\n\
-         out = Path('/content/outputs')\n\
-         out.mkdir(parents=True, exist_ok=True)\n\
-         cmd = ['python3', '{mpnn_entry}', '--pdb_path', '/content/inputs/{stem}.pdb', \
-                '--pdb_path_chains', '{chains_arg}', '--fixed_positions_jsonl', '/content/inputs/fixed_positions.jsonl', \
-                '--out_folder', str(out), '--num_seq_per_target', '{nseq}', '--sampling_temp', '{temps_arg}']\n\
-         if '{soluble_flag}'.strip():\n\
-             cmd.append('--use_soluble_model')\n\
-         sys.exit(subprocess.call(cmd))\n",
+        concat!(
+            "import subprocess, sys\n",
+            "from pathlib import Path\n",
+            "out = Path('/content/outputs')\n",
+            "out.mkdir(parents=True, exist_ok=True)\n",
+            "cmd = ['python3', '{mpnn_entry}', '--pdb_path', '/content/inputs/{stem}.pdb', ",
+            "'--pdb_path_chains', '{chains_arg}', '--fixed_positions_jsonl', '/content/inputs/fixed_positions.jsonl', ",
+            "'--out_folder', str(out), '--num_seq_per_target', '{nseq}', '--sampling_temp', '{temps_arg}']\n",
+            "if '{soluble_flag}'.strip():\n",
+            "    cmd.append('--use_soluble_model')\n",
+            "sys.exit(subprocess.call(cmd))\n",
+        ),
+        mpnn_entry = mpnn_entry,
+        stem = stem,
+        chains_arg = chains_arg,
         nseq = req.num_seq_per_target.clamp(1, 256),
+        temps_arg = temps_arg,
+        soluble_flag = soluble_flag,
     );
 
     let spec = ComputeJobSpec {
