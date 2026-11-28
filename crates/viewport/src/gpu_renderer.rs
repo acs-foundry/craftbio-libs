@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Pure-Rust `wgpu 24 + WGSL` Offscreen `Depth32Float` Biomolecular 3D Renderer (`egui_wgpu::CallbackTrait`).
+//! Pure-Rust `wgpu 30 + WGSL` Offscreen `Depth32Float` Biomolecular 3D Renderer (`egui_wgpu::CallbackTrait`).
 //! - Pass 0 (Directional `1024×1024` `Depth32Float` Shadow Map in `prepare()`):
 //!   - Depth-only opaque meshes + analytical depth spheres from the key directional light (`light_view_proj`)
 //! - Pass 1 (Offscreen `Bgra8Unorm + Depth32Float` in `prepare()`):
@@ -962,6 +962,7 @@ impl CallbackTrait for BiomolPaintCallback {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             if shadow_str > 0.01 {
                 if gpu.opaque_icount > 0 {
@@ -986,6 +987,7 @@ impl CallbackTrait for BiomolPaintCallback {
                 label: Some("biomol_offscreen_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &target.color_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -1007,6 +1009,7 @@ impl CallbackTrait for BiomolPaintCallback {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             if gpu.opaque_icount > 0 {
@@ -1081,8 +1084,8 @@ impl CallbackTrait for BiomolPaintCallback {
 fn depth_state(write_enabled: bool) -> Option<wgpu::DepthStencilState> {
     Some(wgpu::DepthStencilState {
         format: wgpu::TextureFormat::Depth32Float,
-        depth_write_enabled: write_enabled,
-        depth_compare: wgpu::CompareFunction::LessEqual,
+        depth_write_enabled: Some(write_enabled),
+        depth_compare: Some(wgpu::CompareFunction::LessEqual),
         stencil: wgpu::StencilState::default(),
         bias: wgpu::DepthBiasState::default(),
     })
@@ -1159,13 +1162,13 @@ fn create_gpu_resources(
 
     let shadow_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("biomol_shadow_pl_layout"),
-        bind_group_layouts: &[&bgl],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
     });
     let pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("biomol_pl_layout"),
-        bind_group_layouts: &[&bgl, &shadow_bgl],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&bgl), Some(&shadow_bgl)],
+        immediate_size: 0,
     });
 
     // Post-process bind group layout (color_tex + depth_tex via textureLoad)
@@ -1196,8 +1199,8 @@ fn create_gpu_resources(
     });
     let post_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("biomol_post_pl_layout"),
-        bind_group_layouts: &[&bgl, &post_bgl],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&bgl), Some(&post_bgl)],
+        immediate_size: 0,
     });
 
     // 0. Shadow Map Depth Pipelines (Opaque Meshes + Analytical Spheres)
@@ -1217,11 +1220,11 @@ fn create_gpu_resources(
             module: &shadow_mesh_mod,
             entry_point: Some("vs_main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
-            buffers: &[wgpu::VertexBufferLayout {
+            buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<MeshVertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &shadow_mesh_attr,
-            }],
+            })],
         },
         fragment: None,
         primitive: wgpu::PrimitiveState {
@@ -1231,7 +1234,7 @@ fn create_gpu_resources(
         },
         depth_stencil: depth_state(true),
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
 
@@ -1258,11 +1261,11 @@ fn create_gpu_resources(
             module: &shadow_sphere_mod,
             entry_point: Some("vs_main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
-            buffers: &[wgpu::VertexBufferLayout {
+            buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<SphereInstance>() as u64,
                 step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &shadow_sphere_attrs,
-            }],
+            })],
         },
         fragment: Some(wgpu::FragmentState {
             module: &shadow_sphere_mod,
@@ -1273,7 +1276,7 @@ fn create_gpu_resources(
         primitive: wgpu::PrimitiveState::default(),
         depth_stencil: depth_state(true),
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
 
@@ -1310,11 +1313,11 @@ fn create_gpu_resources(
                 module: &mesh_mod,
                 entry_point: Some("vs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<MeshVertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &mesh_attrs,
-                }],
+                })],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &mesh_mod,
@@ -1333,7 +1336,7 @@ fn create_gpu_resources(
             },
             depth_stencil: depth_state(depth_write),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         })
     };
@@ -1387,11 +1390,11 @@ fn create_gpu_resources(
                 module: &sphere_mod,
                 entry_point: Some("vs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<SphereInstance>() as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &sphere_attrs,
-                }],
+                })],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &sphere_mod,
@@ -1406,7 +1409,7 @@ fn create_gpu_resources(
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: depth_state(depth_write),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         })
     };
@@ -1456,11 +1459,11 @@ fn create_gpu_resources(
             module: &cap_mod,
             entry_point: Some("vs_main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
-            buffers: &[wgpu::VertexBufferLayout {
+            buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<CapsuleInstance>() as u64,
                 step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &cap_attrs,
-            }],
+            })],
         },
         fragment: Some(wgpu::FragmentState {
             module: &cap_mod,
@@ -1475,7 +1478,7 @@ fn create_gpu_resources(
         primitive: wgpu::PrimitiveState::default(),
         depth_stencil: depth_state(true),
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
 
@@ -1506,7 +1509,7 @@ fn create_gpu_resources(
         primitive: wgpu::PrimitiveState::default(),
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
 
@@ -1600,7 +1603,7 @@ fn create_gpu_resources(
     }
 }
 
-/// Interactive embeddable `egui` 3D biomolecular viewport widget (backed by `wgpu 24` offscreen
+/// Interactive embeddable `egui` 3D biomolecular viewport widget (backed by `wgpu 30` offscreen
 /// `Depth32Float` + Directional PCF 3×3 Soft Shadows + GPU SSAO/Silhouettes).
 pub fn show_biomol_viewport(
     ui: &mut egui::Ui,

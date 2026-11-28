@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! `craftbio-viewport` — Pure-Rust `wgpu 24 + WGSL` Offscreen `Depth32Float` + SSAO Biomolecular
+//! `craftbio-viewport` — Pure-Rust `wgpu 30 + WGSL` Offscreen `Depth32Float` + SSAO Biomolecular
 //! 3D Viewport, Triangulated Cartoon/SES/Cryo-EM Mesh Engine, `.glb`/`.obj` Exporter, and
 //! Deterministic Headless 4K Publication PNG Renderer shared across the CraftBio Suite.
 

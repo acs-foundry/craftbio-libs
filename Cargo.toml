@@ -5,13 +5,14 @@ members = [
     "crates/struct",
     "crates/scene",
     "crates/viewport",
+    "crates/ui",
     "crates/report",
     "crates/fetch",
     "crates/compute",
 ]
 
 [workspace.package]
-version = "1.5.1"
+version = "2.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
@@ -30,18 +31,24 @@ unreachable = "deny"
 
 [workspace.dependencies]
 # Upstream ArtCraft shared infrastructure (storytold/craft-libs pinned commit)
+craft-dialogs = { git = "https://github.com/storytold/craft-libs", rev = "52d2560c183b2df8b1ffc25ca2078683af146fd6" }
+craft-i18n = { git = "https://github.com/storytold/craft-libs", rev = "52d2560c183b2df8b1ffc25ca2078683af146fd6" }
 craft-ipc = { git = "https://github.com/storytold/craft-libs", rev = "52d2560c183b2df8b1ffc25ca2078683af146fd6" }
+craft-keymap = { git = "https://github.com/storytold/craft-libs", rev = "52d2560c183b2df8b1ffc25ca2078683af146fd6", features = ["egui"] }
+craft-settings = { git = "https://github.com/storytold/craft-libs", rev = "52d2560c183b2df8b1ffc25ca2078683af146fd6" }
+craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "52d2560c183b2df8b1ffc25ca2078683af146fd6", features = ["serde", "native-windows", "system_fonts"] }
+craft-window = { git = "https://github.com/storytold/craft-libs", rev = "52d2560c183b2df8b1ffc25ca2078683af146fd6", features = ["egui", "restore"] }
 
 # Internal workspace crates
 craftbio-struct = { path = "crates/struct" }
 craftbio-scene = { path = "crates/scene" }
 craftbio-report = { path = "crates/report" }
 
-# Standard Rust ecosystem crates (offline-cached)
+# Standard Rust ecosystem crates (aligned with ArtCraft storytold/egui 0.37 + wgpu 30)
 bytemuck = { version = "1", features = ["derive"] }
 crc32fast = "1.5"
-egui = "0.31"
-egui-wgpu = "0.31"
+egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
+egui-wgpu = "0.37"
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 png = "0.18"
 rayon = "1.10"
@@ -49,4 +56,21 @@ rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-wgpu = "24"
+wgpu = "30"
+
+[patch.crates-io]
+ecolor = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+emath = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+epaint = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+epaint_default_fonts = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+egui = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+egui-wgpu = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+# Downstream desktop apps using eframe / egui_extras / winit also need these matching patches in
+# their root Cargo.toml (Cargo ignores [patch.crates-io] inside git dependencies):
+# eframe = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+# egui-winit = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+# egui_glow = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+# egui_extras = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+# egui_kittest = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+# egui_system_font_provider = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+# winit = { git = "https://github.com/storytold/winit.git", rev = "a517b3846ee8457d84ee4975110bfda6797c44dc" }
